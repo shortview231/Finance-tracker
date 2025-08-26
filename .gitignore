@@ -20,4 +20,6 @@ __pycache__/
 # OS cruft
 .DS_Store
 Thumbs.db
+credentials.json
 token*.json
+charts/*.png

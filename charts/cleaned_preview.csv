@@ -1,0 +1,6 @@
+date,name,type,category,description,amount,payment_method,date_dt
+2025-08-25,doodash,income,woek,fast pay,116.0,n/a,2025-08-25
+2025-08-24,dollar general,expense,qol,bought an ash tray,1.35,rj debit,2025-08-24
+,dirt cheap,expense,fun,cones,2.78,rj debit,
+2025-08-21,openai,expense,sub,chatgpt,19.99,rj debit,2025-08-21
+,ameren,expense,electric,electric bill,569.32,rj debit,

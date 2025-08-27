@@ -44,3 +44,19 @@ def lowercase_strings(df: pd.DataFrame, cols=None, make_norm_cols: bool = True) 
             out[c] = s
 
     return out
+
+def coerce_date(df: pd.DataFrame, col: str = "date", out_col: str | None = None) -> pd.DataFrame:
+    """
+    Parse a date column into pandas datetime. Writes to a new column (default: date_dt).
+    Leaves the original column untouched. Invalid parses become NaT.
+    """
+    out = df.copy()
+    if out_col is None:
+        out_col = f"{col}_dt"
+
+    s = out[col].astype("string").str.strip()
+    s = s.replace({"": None, "na": None, "n/a": None, "null": None}, regex=False)
+
+    out[out_col] = pd.to_datetime(s, errors="coerce")
+    return out
+

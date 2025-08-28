@@ -1,7 +1,7 @@
-date,name,type,category,description,amount,payment_method,date_norm,name_norm,type_norm,category_norm,description_norm,amount_norm,payment_method_norm,amount_num,date_dt,amount_signed,bucket
-8/25/2025,DooDash,Income,Woek,Fast Pay,$116.00,N/A,8/25/2025,doodash,income,income,fast pay,$116.00,misc,116.0,2025-08-25,116.0,income
-8/24/2025,Dollar General,expense,QoL,Bought an ash tray,$1.35,RJ Debit,8/24/2025,dollar general,expense,personal / shopping,bought an ash tray,$1.35,debit,1.35,2025-08-24,-1.35,wants
-8/21/2025,Dirt Cheap,expense,fun,Cones,$2.78,Rj Debit,8/21/2025,dirt cheap,expense,entertainment,cones,$2.78,debit,2.78,2025-08-21,-2.78,wants
-8/21/2025,OpenAi,expense,sub,ChatGPT,$19.99,Rj Debit,8/21/2025,openai,expense,subscriptions & software,chatgpt,$19.99,debit,19.99,2025-08-21,-19.99,wants
-8/20/2025,Ameren,expense,electric,Electric bill,$569.32,Rj Debit,8/20/2025,ameren,expense,housing,electric bill,$569.32,debit,569.32,2025-08-20,-569.32,needs
-8/26/2025,Natures Med,expense,weed,Cart,$40.00,rj debit,8/26/2025,natures med,expense,health,cart,$40.00,debit,40.0,2025-08-26,-40.0,needs
+date,name,type,category,description,amount,payment_method,category_norm,date_norm,name_norm,type_norm,description_norm,amount_norm,payment_method_norm,amount_num,date_dt,amount_signed,bucket
+8/25/2025,DooDash,Income,work,Fast Pay,$116.00,N/A,income,8/25/2025,doodash,income,fast pay,$116.00,misc,116.0,2025-08-25,116.0,income
+8/24/2025,Dollar General,expense,QoL,Bought an ash tray,$1.35,RJ Debit,personal / shopping,8/24/2025,dollar general,expense,bought an ash tray,$1.35,debit,1.35,2025-08-24,-1.35,wants
+8/21/2025,Dirt Cheap,expense,fun,Cones,$2.78,Rj Debit,entertainment,8/21/2025,dirt cheap,expense,cones,$2.78,debit,2.78,2025-08-21,-2.78,wants
+8/21/2025,OpenAi,expense,sub,ChatGPT,$19.99,Rj Debit,subscriptions & software,8/21/2025,openai,expense,chatgpt,$19.99,debit,19.99,2025-08-21,-19.99,wants
+8/20/2025,Ameren,expense,electric,Electric bill,$569.32,Rj Debit,housing,8/20/2025,ameren,expense,electric bill,$569.32,debit,569.32,2025-08-20,-569.32,needs
+8/26/2025,Natures Med,expense,weed,Cart,$40.00,rj debit,health,8/26/2025,natures med,expense,cart,$40.00,debit,40.0,2025-08-26,-40.0,needs

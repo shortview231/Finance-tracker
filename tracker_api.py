@@ -1,5 +1,5 @@
 # tracker_api.py
-# CLI for Finance-tracker: clean data, make charts, (stubs for sync-cal & scenarios)
+# CLI for Finance-tracker: clean data, make charts, preview sync-cal & scenarios
 import argparse
 from pathlib import Path
 from typing import Tuple
@@ -7,9 +7,10 @@ from typing import Tuple
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# was: from tracker.clean import normalize_columns, lowercase_strings
-# >>> ADDED: import coerce_date too
-from tracker.clean import normalize_columns, lowercase_strings, coerce_date, coerce_amount
+from tracker.clean import (
+    clean_ledger,
+    validate_ledger,
+)
 from tracker.io import read_ledger_from_sheets  # and optionally write_df_to_sheet
 
 CHARTS_DIR = Path("charts")
@@ -24,41 +25,44 @@ CLEANED_PREVIEW_CSV = CHARTS_DIR / "cleaned_preview.csv"
 # --------------------------
 # Helpers
 # --------------------------
-def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure date/amount have usable dtypes."""
-    out = df.copy()
-    if "date" in out.columns:
-        out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    if "amount" in out.columns:
-        out["amount"] = (
-            pd.to_numeric(
-                out["amount"].astype("string")
-                .str.replace(r"[,$()\s]", "", regex=True)
-                .str.replace(r"^-+$", "0", regex=True),
-                errors="coerce",
-            )
-        )
-    return out
+def _load_clean_df(prefer_csv: bool = True) -> pd.DataFrame:
+    """
+    Load a cleaned dataframe:
+      - if charts/cleaned_preview.csv exists and prefer_csv=True, load it;
+      - else read raw ledger from Sheets and run the full clean_ledger pipeline.
+    Ensures the returned frame has: date_dt, type_norm, amount_num, amount_signed (and best-effort posted_bool/category_norm).
+    """
+    if prefer_csv and CLEANED_PREVIEW_CSV.exists():
+        print(f"ℹ️ Using cleaned preview CSV → {CLEANED_PREVIEW_CSV}")
+        df = pd.read_csv(CLEANED_PREVIEW_CSV)
+        # best-effort ensure dtypes
+        if "date_dt" in df.columns:
+            df["date_dt"] = pd.to_datetime(df["date_dt"], errors="coerce")
+        if "amount_num" in df.columns:
+            df["amount_num"] = pd.to_numeric(df["amount_num"], errors="coerce")
+        if "amount_signed" in df.columns:
+            df["amount_signed"] = pd.to_numeric(df["amount_signed"], errors="coerce")
+        return df
+
+    print("ℹ️ No cleaned_preview.csv (or bypassed) — reading raw ledger from Sheets and cleaning.")
+    raw = read_ledger_from_sheets()
+    df = clean_ledger(raw)
+    return df
+
+
+def _save_clean_preview_csv(df: pd.DataFrame, path: Path = CLEANED_PREVIEW_CSV):
+    df_out = df.copy()
+    # Save friendly string dates
+    if "date_dt" in df_out.columns:
+        df_out["date_dt"] = df_out["date_dt"].dt.strftime("%Y-%m-%d")
+    df_out.to_csv(path, index=False)
+    print(f"✅ Saved cleaned preview to {path}")
 
 
 def _require_columns(df: pd.DataFrame, cols: Tuple[str, ...]):
     missing = set(cols) - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-
-
-def _prefer_clean_csv_or_sheet() -> pd.DataFrame:
-    """Use cleaned_preview.csv if present; else read from Sheets and do minimal cleaning."""
-    if CLEANED_PREVIEW_CSV.exists():
-        print(f"ℹ️ Using cleaned preview CSV → {CLEANED_PREVIEW_CSV}")
-        df = pd.read_csv(CLEANED_PREVIEW_CSV)
-    else:
-        print("ℹ️ No cleaned_preview.csv found — reading raw ledger from Sheets.")
-        df = read_ledger_from_sheets()
-        df = normalize_columns(df)
-        df = lowercase_strings(df, cols=None, make_norm_cols=False)
-    df = _coerce_types(df)
-    return df
 
 
 # --------------------------
@@ -72,68 +76,72 @@ def cmd_clean(
     sheet_tab: str = "Ledger_CLEAN",
 ):
     """
-    Preview-only cleaner by default.
+    Run the full cleaning pipeline and preview results.
     Use --save to persist to CSV or to a Google Sheet tab.
     """
-    # 1) load raw
-    df = read_ledger_from_sheets()
+    raw = read_ledger_from_sheets()
+    dfc = clean_ledger(raw)
 
-    # 2) normalize columns and text (overwrite text to keep downstream simple)
-    dfc = normalize_columns(df)
-    dfc = lowercase_strings(dfc, cols=None, make_norm_cols=False)
+    # validation echo
+    try:
+        validate_ledger(dfc)
+    except Exception as e:
+        print(f"⚠️ Validation check raised: {e}")
 
-
-
-    # 3) parse date text -> datetime into a *new* column date_dt
-    dfc = coerce_date(dfc, col="date", out_col="date_dt")
-    # Format all parsed dates to 'YYYY-MM-DD' as string (NaT stays as NaT)
-    if "date_dt" in dfc.columns:
-        dfc["date_dt"] = dfc["date_dt"].dt.strftime("%Y-%m-%d")
-
-    # 4) clean and coerce amount column into amount_num
-    dfc = coerce_amount(dfc, col="amount", out_col="amount_num")
-
-    # 5) coerce core types for quick stats (still keeps your original columns)
-    dfc = _coerce_types(dfc)
-
-
-    # 4) preview
+    # PREVIEW BLOCKS
     print("\n=== HEAD (first 8 rows) ===")
     print(dfc.head(8))
 
-    # Preview amount cleaning
-    print("\n=== Amount Preview (original vs cleaned) ===")
-    cols_to_show_amt = [c for c in ["amount", "amount_num"] if c in dfc.columns]
+    # Amounts
+    cols_to_show_amt = [c for c in ["amount", "amount_num", "amount_signed"] if c in dfc.columns]
     if cols_to_show_amt:
+        print("\n=== Amount Columns Preview ===")
         print(dfc[cols_to_show_amt].head(10))
 
-    # >>> ADDED: show date comparison and any failures
-    print("\n=== Date Preview (original vs parsed) ===")
-    cols_to_show = [c for c in ["date", "date_dt"] if c in dfc.columns]
-    if cols_to_show:
-        print(dfc[cols_to_show].head(10))
-        bad_dates = dfc[dfc["date_dt"].isna()]
-        if not bad_dates.empty:
-            print("\n=== Bad Dates (failed parse) ===")
-            print(bad_dates[["date"]].head(20))
-    else:
-        print("No date/date_dt columns found.")
+    # Types
+    cols_to_show_type = [c for c in ["type", "type_norm"] if c in dfc.columns]
+    if cols_to_show_type:
+        print("\n=== Type Columns Preview ===")
+        print(dfc[cols_to_show_type].head(10))
 
-    # 5) quick validation
-    try:
-        _require_columns(dfc, ("date", "type", "category", "amount"))
-    except ValueError as e:
-        print(f"⚠️ {e}")
+    # Dates
+    cols_to_show_date = [c for c in ["date", "date_dt"] if c in dfc.columns]
+    if cols_to_show_date:
+        print("\n=== Date Columns Preview ===")
+        tmp = dfc[cols_to_show_date].copy()
+        if "date_dt" in tmp.columns:
+            tmp["date_dt"] = tmp["date_dt"].dt.strftime("%Y-%m-%d")
+        print(tmp.head(10))
+        if "date_dt" in dfc.columns:
+            bad_dates = dfc[dfc["date_dt"].isna()]
+            if not bad_dates.empty:
+                print("\n=== Bad Dates (failed parse) ===")
+                print(bad_dates[["date"]].head(20))
 
-    # 6) persist if asked
+    # Posted
+    if "posted" in dfc.columns or "posted_bool" in dfc.columns:
+        print("\n=== Posted Preview ===")
+        cols_post = [c for c in ["posted", "posted_bool"] if c in dfc.columns]
+        print(dfc[cols_post].head(10))
+
+    # Category
+    cat_cols = [c for c in ["category", "category_norm"] if c in dfc.columns]
+    if cat_cols:
+        print("\n=== Category Preview ===")
+        print(dfc[cat_cols].head(10))
+
+    # Persist if asked
     if save:
         if save_to_csv:
-            dfc.to_csv(csv_path, index=False)
-            print(f"✅ Saved cleaned preview to {csv_path}")
+            _save_clean_preview_csv(dfc, Path(csv_path))
         else:
             try:
                 from tracker.io import write_df_to_sheet
-                write_df_to_sheet(dfc, tab_name=sheet_tab)
+                # Save a sheet-friendly copy (string dates)
+                df_sheet = dfc.copy()
+                if "date_dt" in df_sheet.columns:
+                    df_sheet["date_dt"] = df_sheet["date_dt"].dt.strftime("%Y-%m-%d")
+                write_df_to_sheet(df_sheet, tab_name=sheet_tab)
                 print(f"✅ Wrote cleaned preview to Sheet tab: {sheet_tab}")
             except ImportError:
                 print("⚠️ write_df_to_sheet not found in tracker.io — CSV fallback recommended.")
@@ -142,27 +150,24 @@ def cmd_clean(
 # --------------------------
 # CHARTS command
 # --------------------------
-def _daily_frames(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    _require_columns(df, ("date", "type", "amount"))
-    wk = df.dropna(subset=["date", "amount"]).copy()
-    wk["date"] = wk["date"].dt.date
-    wk["type"] = wk["type"].astype("string").str.lower().str.strip()
+def _daily_frames_from_clean(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build daily net and running balance from cleaned columns.
+    Requires: date_dt (datetime), amount_signed (float)
+    """
+    _require_columns(df, ("date_dt", "amount_signed"))
 
-    daily_income = wk.loc[wk["type"] == "income"].groupby("date", dropna=True)["amount"].sum()
-    daily_expense = wk.loc[wk["type"] == "expense"].groupby("date", dropna=True)["amount"].sum()
+    wk = df.dropna(subset=["date_dt", "amount_signed"]).copy()
+    # normalize to date (no time)
+    wk["date"] = wk["date_dt"].dt.date
+    # daily net = sum of signed amounts per day
+    daily = wk.groupby("date", dropna=True)["amount_signed"].sum().rename("net").reset_index()
 
-    all_days = pd.Index(sorted(set(daily_income.index) | set(daily_expense.index)))
-    daily = pd.DataFrame(index=all_days)
-    daily["income"] = daily_income.reindex(all_days).fillna(0)
-    daily["expense"] = daily_expense.reindex(all_days).fillna(0)
-    daily["net"] = daily["income"] - daily["expense"].abs()
+    # running balance (cumulative sum in chronological order)
+    daily_sorted = daily.sort_values("date").reset_index(drop=True)
+    daily_sorted["running_balance"] = daily_sorted["net"].cumsum()
 
-    run = daily.copy()
-    run["running_balance"] = run["net"].cumsum()
-
-    daily.index.name = "date"
-    run.index.name = "date"
-    return daily.reset_index(), run.reset_index()
+    return daily_sorted[["date", "net"]], daily_sorted[["date", "running_balance"]]
 
 
 def _plot_line(x, y, title: str, ylabel: str, outfile: Path):
@@ -190,16 +195,31 @@ def _plot_pie(series: pd.Series, title: str, outfile: Path):
 
 
 def cmd_charts():
-    df = _prefer_clean_csv_or_sheet()
-    _require_columns(df, ("date", "type", "category", "amount"))
+    df = _load_clean_df(prefer_csv=True)
 
-    daily, run = _daily_frames(df)
+    # Daily + Running Balance from signed amounts
+    daily, run = _daily_frames_from_clean(df)
     _plot_line(daily["date"], daily["net"], "Daily Net", "Net ($)", DAILY_NET_PNG)
     _plot_line(run["date"], run["running_balance"], "Running Balance", "Balance ($)", RUNNING_BALANCE_PNG)
 
-    exp = df[df["type"].astype("string").str.lower().str.strip() == "expense"].copy()
-    exp["abs_amount"] = exp["amount"].abs()
-    by_cat = exp.groupby("category", dropna=True)["abs_amount"].sum().sort_values(ascending=False)
+    # Expenses pie: prefer category_norm; fallback to category
+    cat_col = "category_norm" if "category_norm" in df.columns else ("category" if "category" in df.columns else None)
+    if cat_col is None:
+        print("ℹ️ No category/category_norm column found; skipping expenses pie.")
+        return
+
+    # Only expenses (amount_signed < 0)
+    exp = df[df["amount_signed"] < 0].copy()
+    if exp.empty:
+        print("ℹ️ No expense rows found; skipping expenses pie.")
+        return
+
+    exp["abs_amount"] = exp["amount_signed"].abs()
+    by_cat = exp.groupby(cat_col, dropna=True)["abs_amount"].sum().sort_values(ascending=False)
+
+    if by_cat.empty:
+        print("ℹ️ No expense data grouped; skipping expenses pie.")
+        return
 
     if len(by_cat) > 8:
         top = by_cat.head(8)
@@ -208,26 +228,106 @@ def cmd_charts():
     else:
         pie_data = by_cat
 
-    if pie_data.empty:
-        print("ℹ️ No expense data found; skipping expenses_pie.png")
-    else:
-        _plot_pie(pie_data, "Expenses by Category", EXPENSES_PIE_PNG)
+    _plot_pie(pie_data, "Expenses by Category", EXPENSES_PIE_PNG)
 
 
 # --------------------------
-# SYNC-CAL command (stub)
+# SYNC-CAL command (previewable)
 # --------------------------
+def _preview_calendar_payloads(df: pd.DataFrame, max_rows: int = 10):
+    """
+    Build preview of calendar event titles from cleaned rows with posted_bool == True.
+    """
+    if "posted_bool" not in df.columns:
+        print("ℹ️ posted_bool not present; nothing to sync.")
+        return []
+
+    rows = df[(df["posted_bool"] == True) & df["date_dt"].notna()].copy()
+    if rows.empty:
+        print("ℹ️ No posted==True rows to sync.")
+        return []
+
+    # event title preview: "Income • DoorDash ($45.50)" or "Expense • Rent ($1450.00)"
+    def title_for(r):
+        t = str(r.get("type_norm", "")).title() or "Txn"
+        src = r.get("source") or r.get("description") or ""
+        amt = r.get("amount_num", r.get("amount_signed", 0.0))
+        try:
+            amt = float(amt)
+        except Exception:
+            amt = 0.0
+        if t.lower() == "expense" and amt > 0:
+            amt = -amt  # ensure expense shows negative if mis-signed
+        return f"{t} • {src} (${abs(amt):,.2f})".strip()
+
+    rows = rows.sort_values("date_dt")
+    previews = []
+    for _, r in rows.head(max_rows).iterrows():
+        previews.append({
+            "date": r["date_dt"].date().isoformat(),
+            "title": title_for(r),
+            "category": r.get("category_norm", r.get("category", "")),
+            "payment_method": r.get("payment_method_norm", r.get("payment_method", "")),
+        })
+
+    print("\n=== Calendar Sync Preview (first up to 10) ===")
+    for p in previews:
+        print(f"{p['date']}  —  {p['title']}  [{p['category']}]  ({p['payment_method']})")
+
+    if len(rows) > max_rows:
+        print(f"… and {len(rows) - max_rows} more posted rows ready.")
+
+    return previews
+
+
 def cmd_sync_cal(dry_run: bool = True):
-    print("🗓️ sync-cal: stub\n- Later: read ledger; filter posted==TRUE; push events via Calendar API.")
-    if dry_run:
-        print("Dry-run mode: no writes performed.")
+    """
+    Preview (or later: write) Google Calendar events for posted rows.
+    Currently: preview only. When write-mode is implemented, we'll call tracker.io calendar helpers.
+    """
+    df = _load_clean_df(prefer_csv=True)
+    previews = _preview_calendar_payloads(df, max_rows=10)
+
+    if not dry_run and previews:
+        print("⚠️ Write mode not implemented yet — this is a preview-only stub.")
+    elif not previews:
+        print("ℹ️ Nothing to sync.")
 
 
 # --------------------------
-# SCENARIOS command (stub)
+# SCENARIOS command (previewable)
 # --------------------------
+def _synthesize_demo_ledger(month: str, income_level: str) -> pd.DataFrame:
+    """
+    Create a tiny synthetic ledger for demo charts.
+    month: '2025-08' style
+    income_level: 'low' | 'medium' | 'high'
+    """
+    import numpy as np
+    rng = pd.date_range(f"{month}-01", periods=28, freq="D")
+    base_income = {"low": 50, "medium": 120, "high": 220}[income_level]
+    noise = {"low": 25, "medium": 50, "high": 80}[income_level]
+
+    df = pd.DataFrame({
+        "date": rng.strftime("%Y-%m-%d"),
+        "type": np.where(rng.day % 3 == 0, "income", "expense"),
+        "category": np.where(rng.day % 3 == 0, "gig", np.where(rng.day % 2 == 0, "groceries", "gas")),
+        "amount": np.where(rng.day % 3 == 0, base_income + np.random.randint(-10, 10),
+                           -(noise + np.random.randint(0, 40))),
+        "source": np.where(rng.day % 3 == 0, "demo", ""),
+        "posted": "true",
+    })
+    return clean_ledger(df)
+
+
 def cmd_scenarios():
-    print("📊 scenarios: stub\n- Later: synthesize 3 ledgers and render charts to charts/ folder.")
+    print("📊 Generating demo scenarios (low/medium/high)…")
+    for lvl in ("low", "medium", "high"):
+        df_demo = _synthesize_demo_ledger("2025-08", lvl)
+        daily, run = _daily_frames_from_clean(df_demo)
+        _plot_line(daily["date"], daily["net"], f"Daily Net — {lvl.title()}", "Net ($)", CHARTS_DIR / f"daily_net_{lvl}.png")
+        _plot_line(run["date"], run["running_balance"], f"Running Balance — {lvl.title()}", "Balance ($)", CHARTS_DIR / f"running_balance_{lvl}.png")
+    print("✅ Scenarios generated to charts/ (three pairs of PNGs).")
 
 
 # --------------------------
@@ -237,7 +337,7 @@ def main():
     ap = argparse.ArgumentParser(description="Finance-tracker CLI")
     sub = ap.add_subparsers(dest="cmd")
 
-    p_clean = sub.add_parser("clean", help="Preview cleaning; optionally save a cleaned preview")
+    p_clean = sub.add_parser("clean", help="Run cleaning pipeline; optionally save a cleaned preview")
     p_clean.add_argument("--save", action="store_true",
                          help="Persist cleaned preview (CSV or Sheet tab)")
     p_clean.add_argument("--to-csv", action="store_true",
@@ -247,10 +347,10 @@ def main():
 
     sub.add_parser("charts", help="Generate daily net, running balance, and expenses pie charts")
 
-    p_sync = sub.add_parser("sync-cal", help="Sync posted rows to Google Calendar (stub)")
-    p_sync.add_argument("--write", action="store_true", help="Actually write events (otherwise dry-run)")
+    p_sync = sub.add_parser("sync-cal", help="Preview sync of posted rows to Google Calendar")
+    p_sync.add_argument("--write", action="store_true", help="(Preview only for now)")
 
-    sub.add_parser("scenarios", help="Generate demo scenarios (stub)")
+    sub.add_parser("scenarios", help="Generate demo scenarios and charts")
 
     args = ap.parse_args()
 

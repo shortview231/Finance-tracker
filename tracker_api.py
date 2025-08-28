@@ -7,11 +7,9 @@ from typing import Tuple
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from tracker.clean import (
-    clean_ledger,
-    validate_ledger,
-)
+from tracker.clean import clean_ledger, validate_ledger
 from tracker.io import read_ledger_from_sheets  # and optionally write_df_to_sheet
+from tracker.charts import extra_charts
 
 CHARTS_DIR = Path("charts")
 CHARTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,7 +28,8 @@ def _load_clean_df(prefer_csv: bool = True) -> pd.DataFrame:
     Load a cleaned dataframe:
       - if charts/cleaned_preview.csv exists and prefer_csv=True, load it;
       - else read raw ledger from Sheets and run the full clean_ledger pipeline.
-    Ensures the returned frame has: date_dt, type_norm, amount_num, amount_signed (and best-effort posted_bool/category_norm).
+    Ensures the returned frame has: date_dt, type_norm, amount_num, amount_signed
+    (and best-effort posted_bool/category_norm).
     """
     if prefer_csv and CLEANED_PREVIEW_CSV.exists():
         print(f"ℹ️ Using cleaned preview CSV → {CLEANED_PREVIEW_CSV}")
@@ -38,10 +37,9 @@ def _load_clean_df(prefer_csv: bool = True) -> pd.DataFrame:
         # best-effort ensure dtypes
         if "date_dt" in df.columns:
             df["date_dt"] = pd.to_datetime(df["date_dt"], errors="coerce")
-        if "amount_num" in df.columns:
-            df["amount_num"] = pd.to_numeric(df["amount_num"], errors="coerce")
-        if "amount_signed" in df.columns:
-            df["amount_signed"] = pd.to_numeric(df["amount_signed"], errors="coerce")
+        for c in ("amount_num", "amount_signed"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
         return df
 
     print("ℹ️ No cleaned_preview.csv (or bypassed) — reading raw ledger from Sheets and cleaning.")
@@ -54,7 +52,7 @@ def _save_clean_preview_csv(df: pd.DataFrame, path: Path = CLEANED_PREVIEW_CSV):
     df_out = df.copy()
     # Save friendly string dates
     if "date_dt" in df_out.columns:
-        df_out["date_dt"] = df_out["date_dt"].dt.strftime("%Y-%m-%d")
+        df_out["date_dt"] = pd.to_datetime(df_out["date_dt"], errors="coerce").dt.strftime("%Y-%m-%d")
     df_out.to_csv(path, index=False)
     print(f"✅ Saved cleaned preview to {path}")
 
@@ -110,7 +108,7 @@ def cmd_clean(
         print("\n=== Date Columns Preview ===")
         tmp = dfc[cols_to_show_date].copy()
         if "date_dt" in tmp.columns:
-            tmp["date_dt"] = tmp["date_dt"].dt.strftime("%Y-%m-%d")
+            tmp["date_dt"] = pd.to_datetime(tmp["date_dt"], errors="coerce").dt.strftime("%Y-%m-%d")
         print(tmp.head(10))
         if "date_dt" in dfc.columns:
             bad_dates = dfc[dfc["date_dt"].isna()]
@@ -137,10 +135,9 @@ def cmd_clean(
         else:
             try:
                 from tracker.io import write_df_to_sheet
-                # Save a sheet-friendly copy (string dates)
                 df_sheet = dfc.copy()
                 if "date_dt" in df_sheet.columns:
-                    df_sheet["date_dt"] = df_sheet["date_dt"].dt.strftime("%Y-%m-%d")
+                    df_sheet["date_dt"] = pd.to_datetime(df_sheet["date_dt"], errors="coerce").dt.strftime("%Y-%m-%d")
                 write_df_to_sheet(df_sheet, tab_name=sheet_tab)
                 print(f"✅ Wrote cleaned preview to Sheet tab: {sheet_tab}")
             except ImportError:
@@ -158,8 +155,8 @@ def _daily_frames_from_clean(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFra
     _require_columns(df, ("date_dt", "amount_signed"))
 
     wk = df.dropna(subset=["date_dt", "amount_signed"]).copy()
-    # normalize to date (no time)
-    wk["date"] = wk["date_dt"].dt.date
+    wk["date"] = pd.to_datetime(wk["date_dt"], errors="coerce").dt.date
+
     # daily net = sum of signed amounts per day
     daily = wk.groupby("date", dropna=True)["amount_signed"].sum().rename("net").reset_index()
 
@@ -206,29 +203,39 @@ def cmd_charts():
     cat_col = "category_norm" if "category_norm" in df.columns else ("category" if "category" in df.columns else None)
     if cat_col is None:
         print("ℹ️ No category/category_norm column found; skipping expenses pie.")
-        return
-
-    # Only expenses (amount_signed < 0)
-    exp = df[df["amount_signed"] < 0].copy()
-    if exp.empty:
-        print("ℹ️ No expense rows found; skipping expenses pie.")
-        return
-
-    exp["abs_amount"] = exp["amount_signed"].abs()
-    by_cat = exp.groupby(cat_col, dropna=True)["abs_amount"].sum().sort_values(ascending=False)
-
-    if by_cat.empty:
-        print("ℹ️ No expense data grouped; skipping expenses pie.")
-        return
-
-    if len(by_cat) > 8:
-        top = by_cat.head(8)
-        other = pd.Series({"Other": by_cat.iloc[8:].sum()})
-        pie_data = pd.concat([top, other])
     else:
-        pie_data = by_cat
+        # Only expenses (prefer signed amounts if present)
+        if "amount_signed" in df.columns:
+            exp = df[df["amount_signed"] < 0].copy()
+            if exp.empty:
+                print("ℹ️ No expense rows found; skipping expenses pie.")
+            else:
+                exp["abs_amount"] = exp["amount_signed"].abs()
+                by_cat = exp.groupby(cat_col, dropna=True)["abs_amount"].sum().sort_values(ascending=False)
+                if by_cat.empty:
+                    print("ℹ️ No expense data grouped; skipping expenses pie.")
+                else:
+                    pie_data = by_cat if len(by_cat) <= 8 else pd.concat(
+                        [by_cat.head(8), pd.Series({"Other": by_cat.iloc[8:].sum()})]
+                    )
+                    _plot_pie(pie_data, "Expenses by Category", EXPENSES_PIE_PNG)
+        else:
+            # Fallback for very old frames
+            exp = df[df["type"].astype("string").str.lower().str.strip() == "expense"].copy()
+            if not exp.empty:
+                exp["abs_amount"] = exp["amount"].abs()
+                by_cat = exp.groupby(cat_col, dropna=True)["abs_amount"].sum().sort_values(ascending=False)
+                if not by_cat.empty:
+                    pie_data = by_cat if len(by_cat) <= 8 else pd.concat(
+                        [by_cat.head(8), pd.Series({"Other": by_cat.iloc[8:].sum()})]
+                    )
+                    _plot_pie(pie_data, "Expenses by Category", EXPENSES_PIE_PNG)
 
-    _plot_pie(pie_data, "Expenses by Category", EXPENSES_PIE_PNG)
+    # Extra charts (bucket pie, monthly totals, payment method)
+    try:
+        extra_charts(df, CHARTS_DIR)
+    except Exception as e:
+        print(f"ℹ️ Skipping extra charts: {e}")
 
 
 # --------------------------
@@ -247,7 +254,6 @@ def _preview_calendar_payloads(df: pd.DataFrame, max_rows: int = 10):
         print("ℹ️ No posted==True rows to sync.")
         return []
 
-    # event title preview: "Income • DoorDash ($45.50)" or "Expense • Rent ($1450.00)"
     def title_for(r):
         t = str(r.get("type_norm", "")).title() or "Txn"
         src = r.get("source") or r.get("description") or ""
@@ -257,14 +263,14 @@ def _preview_calendar_payloads(df: pd.DataFrame, max_rows: int = 10):
         except Exception:
             amt = 0.0
         if t.lower() == "expense" and amt > 0:
-            amt = -amt  # ensure expense shows negative if mis-signed
+            amt = -amt
         return f"{t} • {src} (${abs(amt):,.2f})".strip()
 
     rows = rows.sort_values("date_dt")
     previews = []
     for _, r in rows.head(max_rows).iterrows():
         previews.append({
-            "date": r["date_dt"].date().isoformat(),
+            "date": pd.to_datetime(r["date_dt"]).date().isoformat(),
             "title": title_for(r),
             "category": r.get("category_norm", r.get("category", "")),
             "payment_method": r.get("payment_method_norm", r.get("payment_method", "")),
@@ -283,7 +289,7 @@ def _preview_calendar_payloads(df: pd.DataFrame, max_rows: int = 10):
 def cmd_sync_cal(dry_run: bool = True):
     """
     Preview (or later: write) Google Calendar events for posted rows.
-    Currently: preview only. When write-mode is implemented, we'll call tracker.io calendar helpers.
+    Currently: preview only.
     """
     df = _load_clean_df(prefer_csv=True)
     previews = _preview_calendar_payloads(df, max_rows=10)
@@ -300,7 +306,7 @@ def cmd_sync_cal(dry_run: bool = True):
 def _synthesize_demo_ledger(month: str, income_level: str) -> pd.DataFrame:
     """
     Create a tiny synthetic ledger for demo charts.
-    month: '2025-08' style
+    month: 'YYYY-MM' style
     income_level: 'low' | 'medium' | 'high'
     """
     import numpy as np

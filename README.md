@@ -27,12 +27,14 @@ Implemented in [`tracker/clean.py`](tracker/clean.py):
   - `--save --to-csv` → saves to `charts/cleaned_preview.csv`.  
   - (Optional) `--to-sheet` → planned: write to `Ledger_CLEAN` tab in Google Sheets.
 
-- **`charts`**  
-  - Generates:
-    - `charts/daily_net.png` — daily income/expense net.  
-    - `charts/running_balance.png` — cumulative balance trend.  
-    - `charts/expenses_pie.png` — expenses by category.  
-  - Uses the cleaned columns (`date_dt`, `amount_signed`, `category_norm`).
+## 📊 Charts (Generated)
+
+- ![Daily Net](charts/daily_net.png)
+- ![Running Balance](charts/running_balance.png)
+- ![Expenses by Category](charts/expenses_pie.png)
+- ![Spending by Bucket](charts/expenses_bucket.png)
+- ![Monthly Totals](charts/monthly_totals.png)
+- ![Expenses by Payment Method](charts/expenses_by_payment.png)
 
 - **`sync-cal`** *(stub)*  
   - Will push rows where `posted == TRUE` into Google Calendar (Income = green, Expense = red).  

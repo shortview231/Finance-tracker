@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 # was: from tracker.clean import normalize_columns, lowercase_strings
 # >>> ADDED: import coerce_date too
-from tracker.clean import normalize_columns, lowercase_strings, coerce_date
+from tracker.clean import normalize_columns, lowercase_strings, coerce_date, coerce_amount
 from tracker.io import read_ledger_from_sheets  # and optionally write_df_to_sheet
 
 CHARTS_DIR = Path("charts")
@@ -82,15 +82,30 @@ def cmd_clean(
     dfc = normalize_columns(df)
     dfc = lowercase_strings(dfc, cols=None, make_norm_cols=False)
 
-    # >>> ADDED: parse date text -> datetime into a *new* column date_dt
-    dfc = coerce_date(dfc, col="date", out_col="date_dt")
 
-    # 3) coerce core types for quick stats (still keeps your original columns)
+
+    # 3) parse date text -> datetime into a *new* column date_dt
+    dfc = coerce_date(dfc, col="date", out_col="date_dt")
+    # Format all parsed dates to 'YYYY-MM-DD' as string (NaT stays as NaT)
+    if "date_dt" in dfc.columns:
+        dfc["date_dt"] = dfc["date_dt"].dt.strftime("%Y-%m-%d")
+
+    # 4) clean and coerce amount column into amount_num
+    dfc = coerce_amount(dfc, col="amount", out_col="amount_num")
+
+    # 5) coerce core types for quick stats (still keeps your original columns)
     dfc = _coerce_types(dfc)
+
 
     # 4) preview
     print("\n=== HEAD (first 8 rows) ===")
     print(dfc.head(8))
+
+    # Preview amount cleaning
+    print("\n=== Amount Preview (original vs cleaned) ===")
+    cols_to_show_amt = [c for c in ["amount", "amount_num"] if c in dfc.columns]
+    if cols_to_show_amt:
+        print(dfc[cols_to_show_amt].head(10))
 
     # >>> ADDED: show date comparison and any failures
     print("\n=== Date Preview (original vs parsed) ===")

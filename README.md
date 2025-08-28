@@ -27,21 +27,25 @@ Implemented in [`tracker/clean.py`](tracker/clean.py):
   - `--save --to-csv` → saves to `charts/cleaned_preview.csv`.  
   - (Optional) `--to-sheet` → planned: write to `Ledger_CLEAN` tab in Google Sheets.
 
-## 📊 Charts (Generated)
-
-- ![Daily Net](charts/daily_net.png)
-- ![Running Balance](charts/running_balance.png)
-- ![Expenses by Category](charts/expenses_pie.png)
-- ![Spending by Bucket](charts/expenses_bucket.png)
-- ![Monthly Totals](charts/monthly_totals.png)
-- ![Expenses by Payment Method](charts/expenses_by_payment.png)
+- **`charts`**  
+  - Generates baseline charts:  
+    - Daily Net (`daily_net.png`)  
+    - Running Balance (`running_balance.png`)  
+    - Expenses by Category (`expenses_pie.png`)  
+  - Generates extra charts:  
+    - Daily Net with 7-day MA (`daily_net_ma.png`)  
+    - Running Balance Overlay (Planned vs Posted) (`running_balance_overlay.png`)  
+    - Spending by Bucket (`expenses_bucket.png`)  
+    - Monthly Totals (`monthly_totals.png` + `monthly_totals.csv`)  
+    - Expenses by Payment Method (`expenses_by_payment.png`)  
 
 - **`sync-cal`** *(stub)*  
   - Will push rows where `posted == TRUE` into Google Calendar (Income = green, Expense = red).  
   - Currently previews event payloads.
 
-- **`scenarios`** *(stub)*  
-  - Will generate low/medium/high income demo ledgers and charts.
+- **`scenarios`** *(preview)*  
+  - Generates synthetic low/medium/high demo ledgers.  
+  - Produces demo charts into `charts/`.
 
 ### ✅ Docs
 - **Before Cleaning (PDF)** — raw CSV screenshots for portfolio/demo.  
@@ -49,18 +53,18 @@ Implemented in [`tracker/clean.py`](tracker/clean.py):
 
 ---
 
-## 📊 Example Workflow
+## 📊 Charts (Generated)
 
-```bash
-# Preview cleaning
-python tracker_api.py clean
+- ![Daily Net](charts/daily_net.png)
+- ![Daily Net with 7-day MA](charts/daily_net_ma.png)
+- ![Running Balance](charts/running_balance.png)
+- ![Running Balance Overlay (Planned vs Posted)](charts/running_balance_overlay.png)
+- ![Expenses by Category](charts/expenses_pie.png)
+- ![Spending by Bucket](charts/expenses_bucket.png)
+- ![Monthly Totals](charts/monthly_totals.png)
+- ![Expenses by Payment Method](charts/expenses_by_payment.png)
 
-# Save cleaned data to CSV
-python tracker_api.py clean --save --to-csv
-
-# Generate charts from cleaned data
-python tracker_api.py charts
-
+---
 
 ## 📋 Project Checklist
 
@@ -90,14 +94,15 @@ python tracker_api.py charts
 
 ---
 
-### Charts & Analysis (Milestone 2 🚧)
+### Charts & Analysis (Milestone 2 ✅)
 - [x] Daily net chart (`daily_net.png`)
 - [x] Running balance chart (`running_balance.png`)
+- [x] Daily net with 7-day moving average (`daily_net_ma.png`)
+- [x] Running balance overlay: Planned vs Posted (`running_balance_overlay.png`)
 - [x] Expenses by category pie chart (`expenses_pie.png`)
-- [ ] Expenses by bucket (Needs/Wants/etc.)
-- [ ] Monthly rollups
-- [ ] Planned vs Posted comparison
-- [ ] Expense breakdown by payment method
+- [x] Spending by bucket (`expenses_bucket.png`)
+- [x] Monthly rollups (`monthly_totals.png` + CSV export)
+- [x] Expense breakdown by payment method (`expenses_by_payment.png`)
 
 ---
 
@@ -110,10 +115,9 @@ python tracker_api.py charts
 ---
 
 ### Scenarios / Demo Mode (Milestone 4 🚧)
-- [ ] Implement `scenarios`
-- [ ] Auto-generate 3 demo ledgers: low, medium, high income
-- [ ] Save cleaned CSVs
-- [ ] Generate charts for each
+- [x] Implement `scenarios` command (baseline synthetic ledgers + charts)
+- [ ] Expand demo: low/medium/high CSVs
+- [ ] Generate bucket + monthly charts in scenarios as well
 
 ---
 

@@ -145,7 +145,7 @@ def cmd_clean(
 
 
 # --------------------------
-# CHARTS command
+# CHARTS helpers
 # --------------------------
 def _daily_frames_from_clean(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -191,6 +191,78 @@ def _plot_pie(series: pd.Series, title: str, outfile: Path):
     print(f"✅ Saved {outfile}")
 
 
+def _plot_two_lines(x, y1, y2, label1: str, label2: str, title: str, ylabel: str, outfile: Path):
+    plt.figure()
+    plt.plot(x, y1, label=label1)
+    plt.plot(x, y2, label=label2)
+    plt.title(title)
+    plt.xlabel("Date")
+    plt.ylabel(ylabel)
+    plt.xticks(rotation=45, ha="right")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=160)
+    plt.close()
+    print(f"✅ Saved {outfile}")
+
+
+def _daily_net_with_ma(df: pd.DataFrame, window: int = 7) -> pd.DataFrame:
+    """
+    Return a frame with columns: date, net, ma (moving average of net).
+    Requires: date_dt, amount_signed.
+    """
+    need = {"date_dt", "amount_signed"}
+    if not need.issubset(df.columns):
+        raise ValueError("Missing required columns for daily net MA.")
+    wk = df.dropna(subset=["date_dt", "amount_signed"]).copy()
+    wk["date"] = pd.to_datetime(wk["date_dt"], errors="coerce").dt.date
+    daily = wk.groupby("date")["amount_signed"].sum().rename("net").reset_index().sort_values("date")
+    daily["ma"] = daily["net"].rolling(window=window, min_periods=1).mean()
+    return daily
+
+
+def _running_balance_overlay(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a DataFrame with date, posted_running_balance, planned_running_balance.
+    Requires: date_dt, amount_signed. Uses posted_bool if present.
+    """
+    need = {"date_dt", "amount_signed"}
+    if not need.issubset(df.columns):
+        raise ValueError("Missing required cleaned columns for overlay.")
+
+    wk = df.dropna(subset=["date_dt", "amount_signed"]).copy()
+    wk["date"] = pd.to_datetime(wk["date_dt"], errors="coerce").dt.date
+
+    # Planned includes everything
+    planned = wk.groupby("date")["amount_signed"].sum().rename("planned_net").reset_index()
+    planned = planned.sort_values("date")
+    planned["planned_running_balance"] = planned["planned_net"].cumsum()
+
+    # Posted only (if flag exists)
+    if "posted_bool" in wk.columns:
+        posted = wk[wk["posted_bool"] == True].copy()
+        if not posted.empty:
+            posted = posted.groupby("date")["amount_signed"].sum().rename("posted_net").reset_index()
+            posted = posted.sort_values("date")
+            posted["posted_running_balance"] = posted["posted_net"].cumsum()
+        else:
+            posted = pd.DataFrame(columns=["date", "posted_running_balance"])
+    else:
+        posted = pd.DataFrame(columns=["date", "posted_running_balance"])
+
+    # Merge & forward-fill posted line
+    out = pd.merge(
+        planned[["date", "planned_running_balance"]],
+        posted[["date", "posted_running_balance"]],
+        on="date", how="left"
+    ).sort_values("date")
+    out["posted_running_balance"] = out["posted_running_balance"].ffill()
+    return out
+
+
+# --------------------------
+# CHARTS command
+# --------------------------
 def cmd_charts():
     df = _load_clean_df(prefer_csv=True)
 
@@ -198,6 +270,24 @@ def cmd_charts():
     daily, run = _daily_frames_from_clean(df)
     _plot_line(daily["date"], daily["net"], "Daily Net", "Net ($)", DAILY_NET_PNG)
     _plot_line(run["date"], run["running_balance"], "Running Balance", "Balance ($)", RUNNING_BALANCE_PNG)
+
+    # Daily Net with 7-day moving average
+    try:
+        d_ma = _daily_net_with_ma(df, window=7)
+        plt.figure()
+        plt.plot(d_ma["date"], d_ma["net"], label="Daily Net")
+        plt.plot(d_ma["date"], d_ma["ma"], label="7d MA")
+        plt.title("Daily Net with 7-day MA")
+        plt.xlabel("Date")
+        plt.ylabel("Net ($)")
+        plt.xticks(rotation=45, ha="right")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(CHARTS_DIR / "daily_net_ma.png", dpi=160)
+        plt.close()
+        print(f"✅ Saved {CHARTS_DIR / 'daily_net_ma.png'}")
+    except Exception as e:
+        print(f"ℹ️ Skipping daily MA chart: {e}")
 
     # Expenses pie: prefer category_norm; fallback to category
     cat_col = "category_norm" if "category_norm" in df.columns else ("category" if "category" in df.columns else None)
@@ -231,12 +321,38 @@ def cmd_charts():
                     )
                     _plot_pie(pie_data, "Expenses by Category", EXPENSES_PIE_PNG)
 
+    # Running balance overlay: planned vs posted
+    try:
+        ov = _running_balance_overlay(df)
+        if not ov.empty:
+            _plot_two_lines(
+                ov["date"], ov["posted_running_balance"], ov["planned_running_balance"],
+                "Posted", "Planned",
+                "Running Balance — Planned vs Posted",
+                "Balance ($)",
+                CHARTS_DIR / "running_balance_overlay.png"
+            )
+        else:
+            print("ℹ️ Overlay frame empty; skipping running_balance_overlay.png")
+    except Exception as e:
+        print(f"ℹ️ Skipping overlay chart: {e}")
+
     # Extra charts (bucket pie, monthly totals, payment method)
     try:
         extra_charts(df, CHARTS_DIR)
     except Exception as e:
         print(f"ℹ️ Skipping extra charts: {e}")
 
+    # (Optional) Export monthly totals to CSV for docs/portfolio
+    try:
+        from tracker.charts import _month_frame  # reuse helper
+        mf = _month_frame(df)
+        if not mf.empty:
+            outcsv = CHARTS_DIR / "monthly_totals.csv"
+            mf.to_csv(outcsv, index=False)
+            print(f"✅ Saved {outcsv}")
+    except Exception as e:
+        print(f"ℹ️ Skipping monthly totals CSV: {e}")
 
 # --------------------------
 # SYNC-CAL command (previewable)

@@ -459,9 +459,11 @@ def main():
     ap = argparse.ArgumentParser(description="Finance-tracker CLI")
     sub = ap.add_subparsers(dest="cmd")
 
-    p_clean = sub.add_parser("clean", help="Run cleaning pipeline; optionally save a cleaned preview")
+    p_clean = sub.add_parser("clean", help="Run cleaning pipeline; preview or save")
+    p_clean.add_argument("--preview", action="store_true",
+                         help="Preview cleaned dataframe head()")
     p_clean.add_argument("--save", action="store_true",
-                         help="Persist cleaned preview (CSV or Sheet tab)")
+                         help="Persist cleaned ledger (CSV or Sheet tab)")
     p_clean.add_argument("--to-csv", action="store_true",
                          help="Save to charts/cleaned_preview.csv (default if --save is used)")
     p_clean.add_argument("--to-sheet", action="store_true",
@@ -477,9 +479,10 @@ def main():
     args = ap.parse_args()
 
     if args.cmd == "clean":
+        preview = bool(args.preview) or not args.save
         save = bool(args.save)
         save_to_csv = True if (args.to_csv or not args.to_sheet) else False
-        cmd_clean(preview=not save, save=save, save_to_csv=save_to_csv)
+        cmd_clean(preview=preview, save=save, save_to_csv=save_to_csv)
     elif args.cmd == "charts":
         cmd_charts()
     elif args.cmd == "sync-cal":

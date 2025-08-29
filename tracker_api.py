@@ -1,5 +1,6 @@
 # tracker_api.py
 # CLI for Finance-tracker: clean data, make charts, preview sync-cal & scenarios
+
 import argparse
 from pathlib import Path
 from typing import Tuple
@@ -8,9 +9,16 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from tracker.clean import clean_ledger, validate_ledger
-from tracker.io import read_ledger_from_sheets  # and optionally write_df_to_sheet
-from tracker.charts import extra_charts
+from tracker.io import read_ledger_from_sheets  # (write_df_to_sheet used lazily)
 
+# Optional extras from tracker.charts; safe if not present
+try:
+    from tracker.charts import extra_charts, _month_frame  # optional helpers
+except Exception:
+    extra_charts = None
+    _month_frame = None
+
+# Paths
 CHARTS_DIR = Path("charts")
 CHARTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -27,9 +35,8 @@ def _load_clean_df(prefer_csv: bool = True) -> pd.DataFrame:
     """
     Load a cleaned dataframe:
       - if charts/cleaned_preview.csv exists and prefer_csv=True, load it;
-      - else read raw ledger from Sheets and run the full clean_ledger pipeline.
-    Ensures the returned frame has: date_dt, type_norm, amount_num, amount_signed
-    (and best-effort posted_bool/category_norm).
+      - else read raw ledger from Sheets and run clean_ledger.
+    Ensures: date_dt, type_norm, amount_num, amount_signed (and category_norm if available).
     """
     if prefer_csv and CLEANED_PREVIEW_CSV.exists():
         print(f"ℹ️ Using cleaned preview CSV → {CLEANED_PREVIEW_CSV}")
@@ -167,7 +174,7 @@ def _daily_frames_from_clean(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFra
     return daily_sorted[["date", "net"]], daily_sorted[["date", "running_balance"]]
 
 
-def _plot_line(x, y, title: str, ylabel: str, outfile: Path):
+def _plot_line(x, y, title: str, ylabel: str, outfile: Path, preview: bool = False):
     plt.figure()
     plt.plot(x, y)
     plt.title(title)
@@ -176,22 +183,26 @@ def _plot_line(x, y, title: str, ylabel: str, outfile: Path):
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     plt.savefig(outfile, dpi=160)
+    if preview:
+        plt.show()
     plt.close()
     print(f"✅ Saved {outfile}")
 
 
-def _plot_pie(series: pd.Series, title: str, outfile: Path):
+def _plot_pie(series: pd.Series, title: str, outfile: Path, preview: bool = False):
     plt.figure()
     series.plot(kind="pie", autopct="%1.0f%%")
     plt.ylabel("")
     plt.title(title)
     plt.tight_layout()
     plt.savefig(outfile, dpi=160)
+    if preview:
+        plt.show()
     plt.close()
     print(f"✅ Saved {outfile}")
 
 
-def _plot_two_lines(x, y1, y2, label1: str, label2: str, title: str, ylabel: str, outfile: Path):
+def _plot_two_lines(x, y1, y2, label1: str, label2: str, title: str, ylabel: str, outfile: Path, preview: bool = False):
     plt.figure()
     plt.plot(x, y1, label=label1)
     plt.plot(x, y2, label=label2)
@@ -202,6 +213,8 @@ def _plot_two_lines(x, y1, y2, label1: str, label2: str, title: str, ylabel: str
     plt.legend()
     plt.tight_layout()
     plt.savefig(outfile, dpi=160)
+    if preview:
+        plt.show()
     plt.close()
     print(f"✅ Saved {outfile}")
 
@@ -263,17 +276,28 @@ def _running_balance_overlay(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------
 # CHARTS command
 # --------------------------
-def cmd_charts():
+def cmd_charts(preview: bool = False):
     df = _load_clean_df(prefer_csv=True)
 
     # Daily + Running Balance from signed amounts
     daily, run = _daily_frames_from_clean(df)
-    _plot_line(daily["date"], daily["net"], "Daily Net", "Net ($)", DAILY_NET_PNG)
-    _plot_line(run["date"], run["running_balance"], "Running Balance", "Balance ($)", RUNNING_BALANCE_PNG)
+    _plot_line(
+        daily["date"], daily["net"],
+        "Daily Net", "Net ($)",
+        DAILY_NET_PNG,
+        preview=preview,
+    )
+    _plot_line(
+        run["date"], run["running_balance"],
+        "Running Balance", "Balance ($)",
+        RUNNING_BALANCE_PNG,
+        preview=preview,
+    )
 
-    # Daily Net with 7-day moving average
+    # Daily Net with 7-day moving average (extra)
     try:
         d_ma = _daily_net_with_ma(df, window=7)
+        outpath = CHARTS_DIR / "daily_net_ma.png"
         plt.figure()
         plt.plot(d_ma["date"], d_ma["net"], label="Daily Net")
         plt.plot(d_ma["date"], d_ma["ma"], label="7d MA")
@@ -283,9 +307,11 @@ def cmd_charts():
         plt.xticks(rotation=45, ha="right")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(CHARTS_DIR / "daily_net_ma.png", dpi=160)
+        plt.savefig(outpath, dpi=160)
+        if preview:
+            plt.show()
         plt.close()
-        print(f"✅ Saved {CHARTS_DIR / 'daily_net_ma.png'}")
+        print(f"✅ Saved {outpath}")
     except Exception as e:
         print(f"ℹ️ Skipping daily MA chart: {e}")
 
@@ -294,7 +320,6 @@ def cmd_charts():
     if cat_col is None:
         print("ℹ️ No category/category_norm column found; skipping expenses pie.")
     else:
-        # Only expenses (prefer signed amounts if present)
         if "amount_signed" in df.columns:
             exp = df[df["amount_signed"] < 0].copy()
             if exp.empty:
@@ -302,57 +327,54 @@ def cmd_charts():
             else:
                 exp["abs_amount"] = exp["amount_signed"].abs()
                 by_cat = exp.groupby(cat_col, dropna=True)["abs_amount"].sum().sort_values(ascending=False)
-                if by_cat.empty:
-                    print("ℹ️ No expense data grouped; skipping expenses pie.")
-                else:
+                if not by_cat.empty:
                     pie_data = by_cat if len(by_cat) <= 8 else pd.concat(
                         [by_cat.head(8), pd.Series({"Other": by_cat.iloc[8:].sum()})]
                     )
-                    _plot_pie(pie_data, "Expenses by Category", EXPENSES_PIE_PNG)
+                    _plot_pie(pie_data, "Expenses by Category", EXPENSES_PIE_PNG, preview=preview)
         else:
-            # Fallback for very old frames
+            # Very old frames fallback
             exp = df[df["type"].astype("string").str.lower().str.strip() == "expense"].copy()
             if not exp.empty:
-                exp["abs_amount"] = exp["amount"].abs()
+                exp["abs_amount"] = pd.to_numeric(df["amount"], errors="coerce").abs()
                 by_cat = exp.groupby(cat_col, dropna=True)["abs_amount"].sum().sort_values(ascending=False)
                 if not by_cat.empty:
                     pie_data = by_cat if len(by_cat) <= 8 else pd.concat(
                         [by_cat.head(8), pd.Series({"Other": by_cat.iloc[8:].sum()})]
                     )
-                    _plot_pie(pie_data, "Expenses by Category", EXPENSES_PIE_PNG)
+                    _plot_pie(pie_data, "Expenses by Category", EXPENSES_PIE_PNG, preview=preview)
 
-    # Running balance overlay: planned vs posted
+    # Running balance overlay: planned vs posted (extra)
     try:
         ov = _running_balance_overlay(df)
         if not ov.empty:
             _plot_two_lines(
-                ov["date"], ov["posted_running_balance"], ov["planned_running_balance"],
+                ov["date"],
+                ov["posted_running_balance"], ov["planned_running_balance"],
                 "Posted", "Planned",
                 "Running Balance — Planned vs Posted",
                 "Balance ($)",
-                CHARTS_DIR / "running_balance_overlay.png"
+                CHARTS_DIR / "running_balance_overlay.png",
+                preview=preview,
             )
         else:
             print("ℹ️ Overlay frame empty; skipping running_balance_overlay.png")
     except Exception as e:
         print(f"ℹ️ Skipping overlay chart: {e}")
 
-    # Extra charts (bucket pie, monthly totals, payment method)
+    # Optional extras from tracker.charts (if present)
     try:
-        extra_charts(df, CHARTS_DIR)
+        if callable(extra_charts):
+            extra_charts(df, CHARTS_DIR)
+        if callable(_month_frame):
+            mf = _month_frame(df)
+            if not mf.empty:
+                outcsv = CHARTS_DIR / "monthly_totals.csv"
+                mf.to_csv(outcsv, index=False)
+                print(f"✅ Saved {outcsv}")
     except Exception as e:
-        print(f"ℹ️ Skipping extra charts: {e}")
+        print(f"ℹ️ Skipping optional extras: {e}")
 
-    # (Optional) Export monthly totals to CSV for docs/portfolio
-    try:
-        from tracker.charts import _month_frame  # reuse helper
-        mf = _month_frame(df)
-        if not mf.empty:
-            outcsv = CHARTS_DIR / "monthly_totals.csv"
-            mf.to_csv(outcsv, index=False)
-            print(f"✅ Saved {outcsv}")
-    except Exception as e:
-        print(f"ℹ️ Skipping monthly totals CSV: {e}")
 
 # --------------------------
 # SYNC-CAL command (previewable)
@@ -469,7 +491,9 @@ def main():
     p_clean.add_argument("--to-sheet", action="store_true",
                          help="Save to Google Sheet tab Ledger_CLEAN instead of CSV")
 
-    sub.add_parser("charts", help="Generate daily net, running balance, and expenses pie charts")
+    p_charts = sub.add_parser("charts", help="Generate charts")
+    p_charts.add_argument("--preview", action="store_true",
+                          help="Show charts interactively instead of saving to PNGs")
 
     p_sync = sub.add_parser("sync-cal", help="Preview sync of posted rows to Google Calendar")
     p_sync.add_argument("--write", action="store_true", help="(Preview only for now)")
@@ -484,7 +508,7 @@ def main():
         save_to_csv = True if (args.to_csv or not args.to_sheet) else False
         cmd_clean(preview=preview, save=save, save_to_csv=save_to_csv)
     elif args.cmd == "charts":
-        cmd_charts()
+        cmd_charts(preview=args.preview)
     elif args.cmd == "sync-cal":
         dry = not getattr(args, "write", False)
         cmd_sync_cal(dry_run=dry)

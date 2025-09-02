@@ -3,7 +3,7 @@
 
 import argparse
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List, Dict, Any
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -47,6 +47,11 @@ def _load_clean_df(prefer_csv: bool = True) -> pd.DataFrame:
         for c in ("amount_num", "amount_signed"):
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
+        # normalize posted column shape if present in CSV
+        if "posted" in df.columns:
+            # coerce posted to boolean-ish values
+            s = df["posted"].astype(str).str.strip().str.lower()
+            df["posted"] = s.isin({"true", "t", "yes", "y", "1", "paid"})
         return df
 
     print("ℹ️ No cleaned_preview.csv (or bypassed) — reading raw ledger from Sheets and cleaning.")
@@ -70,6 +75,21 @@ def _require_columns(df: pd.DataFrame, cols: Tuple[str, ...]):
         raise ValueError(f"Missing required columns: {missing}")
 
 
+def _posted_mask(df: pd.DataFrame) -> pd.Series:
+    """
+    Unified 'posted' mask:
+      - prefer new unified 'posted' column (bool)
+      - else fall back to legacy 'posted_bool'
+      - else treat everything as posted (all True)
+    """
+    if "posted" in df.columns:
+        return df["posted"].fillna(True) == True  # noqa: E712
+    if "posted_bool" in df.columns:
+        return df["posted_bool"].fillna(True) == True  # noqa: E712
+    # No flag columns at all: assume posted
+    return pd.Series(True, index=df.index)
+
+
 # --------------------------
 # CLEAN command
 # --------------------------
@@ -87,7 +107,7 @@ def cmd_clean(
     raw = read_ledger_from_sheets()
     dfc = clean_ledger(raw)
 
-    # validation echo
+    # validation echo (on cleaned frame for a quick sanity view)
     try:
         validate_ledger(dfc)
     except Exception as e:
@@ -123,11 +143,11 @@ def cmd_clean(
                 print("\n=== Bad Dates (failed parse) ===")
                 print(bad_dates[["date"]].head(20))
 
-    # Posted
-    if "posted" in dfc.columns or "posted_bool" in dfc.columns:
+    # Posted (supports either/both columns)
+    posted_cols = [c for c in ["posted", "posted_bool"] if c in dfc.columns]
+    if posted_cols:
         print("\n=== Posted Preview ===")
-        cols_post = [c for c in ["posted", "posted_bool"] if c in dfc.columns]
-        print(dfc[cols_post].head(10))
+        print(dfc[posted_cols].head(10))
 
     # Category
     cat_cols = [c for c in ["category", "category_norm"] if c in dfc.columns]
@@ -237,7 +257,7 @@ def _daily_net_with_ma(df: pd.DataFrame, window: int = 7) -> pd.DataFrame:
 def _running_balance_overlay(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build a DataFrame with date, posted_running_balance, planned_running_balance.
-    Requires: date_dt, amount_signed. Uses posted_bool if present.
+    Requires: date_dt, amount_signed. Uses unified posted mask (prefers 'posted', falls back to 'posted_bool').
     """
     need = {"date_dt", "amount_signed"}
     if not need.issubset(df.columns):
@@ -251,15 +271,13 @@ def _running_balance_overlay(df: pd.DataFrame) -> pd.DataFrame:
     planned = planned.sort_values("date")
     planned["planned_running_balance"] = planned["planned_net"].cumsum()
 
-    # Posted only (if flag exists)
-    if "posted_bool" in wk.columns:
-        posted = wk[wk["posted_bool"] == True].copy()
-        if not posted.empty:
-            posted = posted.groupby("date")["amount_signed"].sum().rename("posted_net").reset_index()
-            posted = posted.sort_values("date")
-            posted["posted_running_balance"] = posted["posted_net"].cumsum()
-        else:
-            posted = pd.DataFrame(columns=["date", "posted_running_balance"])
+    # Posted only (unified)
+    mask_posted = _posted_mask(wk)
+    posted = wk[mask_posted].copy()
+    if not posted.empty:
+        posted = posted.groupby("date")["amount_signed"].sum().rename("posted_net").reset_index()
+        posted = posted.sort_values("date")
+        posted["posted_running_balance"] = posted["posted_net"].cumsum()
     else:
         posted = pd.DataFrame(columns=["date", "posted_running_balance"])
 
@@ -379,22 +397,20 @@ def cmd_charts(preview: bool = False):
 # --------------------------
 # SYNC-CAL command (previewable)
 # --------------------------
-def _preview_calendar_payloads(df: pd.DataFrame, max_rows: int = 10):
+def _preview_calendar_payloads(df: pd.DataFrame, max_rows: int = 10) -> List[Dict[str, Any]]:
     """
-    Build preview of calendar event titles from cleaned rows with posted_bool == True.
+    Build preview of calendar event titles from cleaned rows with posted == True (fallback to posted_bool).
     """
-    if "posted_bool" not in df.columns:
-        print("ℹ️ posted_bool not present; nothing to sync.")
-        return []
-
-    rows = df[(df["posted_bool"] == True) & df["date_dt"].notna()].copy()
+    mask = _posted_mask(df)
+    rows = df[mask & df["date_dt"].notna()].copy()
     if rows.empty:
-        print("ℹ️ No posted==True rows to sync.")
+        print("ℹ️ No posted rows to sync.")
         return []
 
     def title_for(r):
         t = str(r.get("type_norm", "")).title() or "Txn"
-        src = r.get("source") or r.get("description") or ""
+        # prefer normalized name/description when available
+        src = r.get("name_norm") or r.get("source_norm") or r.get("description_norm") or r.get("source") or r.get("description") or ""
         amt = r.get("amount_num", r.get("amount_signed", 0.0))
         try:
             amt = float(amt)
@@ -405,7 +421,7 @@ def _preview_calendar_payloads(df: pd.DataFrame, max_rows: int = 10):
         return f"{t} • {src} (${abs(amt):,.2f})".strip()
 
     rows = rows.sort_values("date_dt")
-    previews = []
+    previews: List[Dict[str, Any]] = []
     for _, r in rows.head(max_rows).iterrows():
         previews.append({
             "date": pd.to_datetime(r["date_dt"]).date().isoformat(),
@@ -418,8 +434,9 @@ def _preview_calendar_payloads(df: pd.DataFrame, max_rows: int = 10):
     for p in previews:
         print(f"{p['date']}  —  {p['title']}  [{p['category']}]  ({p['payment_method']})")
 
-    if len(rows) > max_rows:
-        print(f"… and {len(rows) - max_rows} more posted rows ready.")
+    more = max(0, len(rows) - min(max_rows, len(rows)))
+    if more:
+        print(f"… and {more} more posted rows ready.")
 
     return previews
 

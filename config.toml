@@ -4,5 +4,5 @@ calendar_id    = "primary"
 timezone       = "America/Chicago"
 
 [ranges]
-ledger = "ledger!A:G"
-recurr = "expenses!A:D"
+ledger = "ledger!A:Z"
+recurr = "expenses!A:Z"

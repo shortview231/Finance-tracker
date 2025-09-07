@@ -1,14 +1,14 @@
 # tracker/clean.py
 # Unified cleaning utilities for Finance-Tracker
-# - Column & text normalization + typo fixes (woek->work, etc.)
-# - Date/amount coercion with strict checks
-# - Type normalization -> income/expense
-# - Category/payment method canonicalization
-# - Posted -> boolean
+# - Header normalization + aliasing (from mappings.py)
+# - Text cleanup + typo fixes (from mappings.py)
+# - Type/category/payment canonicalization (schema-driven)
+# - Date/amount coercion
+# - Posted -> boolean (robust even if raw missing)
 # - Signed amounts (+ income, − expense)
 # - Needs/Wants/Savings/Taxes bucket
-# - Validation + typo suggestions (closest match)
-# - Schema enforcement (optional strict mode)
+# - Validation + closest-match suggestions
+# - Final column ordering (CLEAN_HEADERS first, extras preserved)
 
 from __future__ import annotations
 
@@ -20,8 +20,26 @@ from typing import Optional, Iterable, Mapping, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+# === central schema + mappings ===
+from .schema import (
+    RAW_REQUIRED,
+    RAW_OPTIONAL_DEFAULTS,
+    VALUE_DOMAINS,
+    CLEAN_HEADERS,
+)
+from .mappings import (
+    HEADER_ALIASES,
+    TYPE_MAP,
+    CATEGORY_MAP,
+    PAYMENT_METHOD_MAP,
+    SPELLING_FIXES,
+    BUCKET_RULES,
+)
+
 __all__ = [
     "normalize_columns",
+    "apply_header_aliases",
+    "ensure_required_optional",
     "lowercase_strings",
     "normalize_type",
     "coerce_date",
@@ -47,112 +65,28 @@ TEXT_DTYPES = ("object", "string")
 DEBUG_DATES = False
 DEBUG_UNMAPPED = True
 
-# --- Canonical category mapping (free-text -> stable bucket) ---
-CATEGORY_MAP: Mapping[Iterable[str] | str, str] = {
-    # INCOME-LIKE CATEGORIES
-    ("income", "salary", "paycheck", "pay", "tips", "bonus", "deposit", "refund", "work", "woek"): "income",
-
-    # HOUSING
-    ("rent", "mortgage", "lease"): "housing",
-    ("ameren", "electric", "electricity", "natural gas", "gas bill", "water", "trash", "internet", "wifi", "utilities"): "housing",
-
-    # TRANSPORTATION
-    ("gas", "fuel", "parking", "car payment", "car note", "car insurance", "maintenance",
-     "uber", "lyft", "rideshare", "transit", "bus", "metro"): "transportation",
-
-    # GROCERIES
-    ("groceries", "grocery", "sam's", "sams", "sam’s", "aldi", "walmart food", "schnucks",
-     "dollar general", "household staples"): "groceries",
-
-    # DINING
-    ("restaurant", "restaurants", "takeout", "fast food", "coffee", "starbucks",
-     "mcdonalds", "taco bell", "food out", "dirt cheap"): "dining",
-
-    # HEALTH
-    ("doctor", "dentist", "therapy", "pharmacy", "prescriptions", "rx", "gym", "fitness"): "health",
-    ("weed", "cannabis", "natures med", "nature's med", "medical cannabis"): "health",
-
-    # KIDS & FAMILY
-    ("school", "supplies", "childcare", "daycare", "kids", "family activity"): "kids & family",
-
-    # SUBSCRIPTIONS & SOFTWARE
-    ("openai", "netflix", "spotify", "prime", "hulu", "max", "apple one",
-     "subscription", "subscriptions", "sub", "adobe", "microsoft 365"): "subscriptions & software",
-
-    # DEBT & BANKING
-    ("loan payment", "credit card", "cc payment", "minimum payment", "overdraft fee",
-     "bank fee", "interest", "late fee"): "debt & banking",
-
-    # PERSONAL / SHOPPING
-    ("personal", "shopping", "clothes", "household", "qol", "quality of life", "gift", "gifts"): "personal / shopping",
-
-    # ENTERTAINMENT
-    ("entertainment", "movies", "fun", "games", "concerts", "hobbies"): "entertainment",
-
-    # SAVINGS & INVESTING
-    ("savings", "transfer to savings", "brokerage", "investing", "roth", "ira", "401k"): "savings & investing",
-
-    # TAXES
-    ("tax", "taxes", "quarterly tax", "irs", "state tax", "tax penalty", "property tax"): "taxes",
-
-    # BUSINESS (optional)
-    ("business", "equipment", "supplies", "phone (work)", "software (work)", "gig expense", "mileage"): "business",
-}
-
-# --- Payment method mapping (free-text -> stable) ---
-PAYMENT_MAP: Mapping[Iterable[str] | str, str] = {
-    ("debit", "debit card", "card", "rj debit"): "debit",
-    ("credit", "credit card", "cc"): "credit",
-    ("cash",): "cash",
-    ("zelle", "venmo", "paypal", "cash app", "cashapp"): "transfer",
-    ("ach", "bank transfer", "eft"): "transfer",
-    ("fast pay", "fastpay", "doordash fast pay"): "fast pay",
-    ("check", "cheque"): "check",
-    ("n/a", "na", "none", "unknown"): "misc",
-}
-
-# --- Meta-bucket: Needs/Wants/Savings/Taxes (+ Income) ---
-BUCKET_MAP: Mapping[str, str] = {
-    "income": "income",
-    "housing": "needs",
-    "transportation": "needs",
-    "groceries": "needs",
-    "health": "needs",
-    "kids & family": "needs",
-    "debt & banking": "needs",
-    "subscriptions & software": "wants",
-    "personal / shopping": "wants",
-    "entertainment": "wants",
-    "business": "wants",
-    "savings & investing": "savings",
-    "taxes": "taxes",
-    "misc": "wants",
-}
-
-TYPE_ALLOWED = {"income", "expense"}
-CATEGORY_ALLOWED = set(CATEGORY_MAP.values()) | {"misc"}  # canonical set + misc
-PAYMENT_ALLOWED = set(PAYMENT_MAP.values())
+TYPE_ALLOWED = VALUE_DOMAINS.get("type", {"income", "expense"})
 
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
-
-def _build_canon_map(mapping: Mapping[Iterable[str] | str, str]) -> Dict[str, str]:
-    """Flatten dict[(aliases)->value] into simple dict[str->value], lowercased keys."""
-    canon: dict[str, str] = {}
-    for keys, val in mapping.items():
-        if isinstance(keys, (list, tuple, set)):
-            for k in keys:
-                canon[str(k).lower()] = val
-        else:
-            canon[str(keys).lower()] = mapping[keys]  # type: ignore[index]
-    return canon
 
 def _closest(value: str, candidates: Iterable[str], n: int = 1) -> List[str]:
     """Return up to n close matches from candidates."""
     if not value:
         return []
     return difflib.get_close_matches(value, list(candidates), n=n, cutoff=0.6)
+
+def _canon_map_from_aliases(mapping: Mapping[str, str]) -> Dict[str, str]:
+    """
+    Build a normalized alias map keyed by snake_case (lower, spaces->underscore) to the canonical name.
+    E.g., 'Payment Method' -> 'payment_method'
+    """
+    canon: dict[str, str] = {}
+    for k, v in mapping.items():
+        kk = str(k).strip().lower().replace(" ", "_")
+        canon[kk] = v
+    return canon
 
 # -------------------------------------------------------------------
 # Core normalizers
@@ -169,81 +103,72 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     )
     return out
 
+def apply_header_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply HEADER_ALIASES after snake_casing so raw sheet headers map to our canonical raw names."""
+    out = df.copy()
+    alias_norm = _canon_map_from_aliases(HEADER_ALIASES)
+    out = out.rename(columns=alias_norm)
+    return out
+
+def ensure_required_optional(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure required columns exist; create missing optional columns with defaults."""
+    out = df.copy()
+    for col in RAW_REQUIRED + list(RAW_OPTIONAL_DEFAULTS):
+        if col not in out.columns:
+            out[col] = RAW_OPTIONAL_DEFAULTS.get(col, "")
+    return out
 
 def lowercase_strings(df: pd.DataFrame, make_norm_cols: bool = False) -> pd.DataFrame:
-    """Normalize text columns: lowercase, strip, collapse spaces, fix common typos on known fields.
+    """Normalize text columns: lowercase, strip, collapse spaces, fix common typos from SPELLING_FIXES.
     If make_norm_cols=True, also create *_norm for ALL text columns (safe defaults)."""
     out = df.copy()
 
-    # Canonical typo dictionaries (known fields)
-    source_map = {
-        "woek": "work",
-        "wrk": "work",
-        "doodash": "doordash",
-        "door dash": "doordash",
-        "doo dash": "doordash",
-    }
-    category_map = {
-        "woek": "work",  # ensure it normalizes before canonical mapping
-        "grcoeries": "groceries",
-        "grocceries": "groceries",
-        "groceris": "groceries",
-    }
-
-    if "source" in out.columns:
-        out["source_norm"] = (
-            out["source"]
-            .astype("string").str.lower().str.strip()
+    def norm_series(s: pd.Series) -> pd.Series:
+        return (
+            s.astype("string")
+            .str.lower()
+            .str.strip()
             .str.replace(r"\s+", " ", regex=True)
-            .replace(source_map)
+            .replace(SPELLING_FIXES)
         )
 
-    if "category" in out.columns:
-        out["category_norm"] = (
-            out["category"]
-            .astype("string").str.lower().str.strip()
-            .str.replace(r"\s+", " ", regex=True)
-            .replace(category_map)
-        )
+    for col in ("source", "category", "description", "payment_method", "name"):
+        if col in out.columns:
+            norm_col = f"{col}_norm"
+            out[norm_col] = norm_series(out[col])
 
-    # Optionally create *_norm for ALL text columns (don’t overwrite ones we just set)
     if make_norm_cols:
         for c in out.columns:
             if out[c].dtype.name in TEXT_DTYPES and not c.endswith("_norm"):
                 norm_c = f"{c}_norm"
                 if norm_c not in out.columns:
                     out[norm_c] = (
-                        out[c]
-                        .astype("string").str.lower().str.strip()
+                        out[c].astype("string").str.lower().str.strip()
                         .str.replace(r"\s+", " ", regex=True)
                     )
-
     return out
-
 
 def normalize_type(df: pd.DataFrame, col: str = "type", out_col: Optional[str] = None) -> pd.DataFrame:
     """Normalize type column to 'income' or 'expense' in a new column (default: type_norm)."""
     out = df.copy()
     out_col = out_col or f"{col}_norm"
 
-    income_variants = {"income", "in", "pay", "salary", "deposit", "credit"}
-    expense_variants = {"expense", "exp", "bill", "debit", "purchase", "withdrawal"}
+    # Flatten TYPE_MAP keys to handle many variants
+    flat_type_map: Dict[str, str] = {}
+    for k, v in TYPE_MAP.items():
+        flat_type_map[str(k).strip().lower()] = v
 
     def norm(val):
         if pd.isna(val):
             return None
         v = str(val).strip().lower()
-        if v in income_variants:
-            return "income"
-        if v in expense_variants:
-            return "expense"
-        # fuzzy suggestion
+        if v in flat_type_map:
+            return flat_type_map[v]
         close = _closest(v, TYPE_ALLOWED, n=1)
         return close[0] if close else v  # keep unknown visible
 
     out[out_col] = out[col].apply(norm)
     return out
-
 
 def coerce_date(df: pd.DataFrame, col: str = "date", out_col: Optional[str] = None) -> pd.DataFrame:
     """
@@ -291,7 +216,6 @@ def coerce_date(df: pd.DataFrame, col: str = "date", out_col: Optional[str] = No
     out[out_col] = pd.to_datetime(s_fixed, errors="coerce")
     return out
 
-
 def coerce_amount(df: pd.DataFrame, col: str = "amount", out_col: Optional[str] = None) -> pd.DataFrame:
     """
     Clean and convert an amount column to float (idempotent).
@@ -317,14 +241,10 @@ def coerce_amount(df: pd.DataFrame, col: str = "amount", out_col: Optional[str] 
     out[out_col] = pd.to_numeric(s, errors="coerce").fillna(0.0)
     return out
 
-# -------------------------------------------------------------------
-# Category / payment canonicalization
-# -------------------------------------------------------------------
-
 def normalize_simple(
     df: pd.DataFrame,
     col: str,
-    mapping: Optional[Mapping[Iterable[str] | str, str]] = None,
+    mapping: Optional[Mapping[str, str]] = None,
     out_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """Lowercase/trim a text column and optionally map common variants/typos to canonical values."""
@@ -333,12 +253,14 @@ def normalize_simple(
     s = out[col].astype("string").str.strip().str.replace(r"\s+", " ", regex=True).str.lower()
 
     if mapping:
-        canon = _build_canon_map(mapping)
-        s = s.map(lambda v: canon.get(v, v))
+        # flatten mapping (already flat in mappings.py, but we normalize keys anyway)
+        flat: Dict[str, str] = {}
+        for k, v in mapping.items():
+            flat[str(k).strip().lower()] = v
+        s = s.map(lambda v: flat.get(v, v))
 
     out[out_col] = s
     return out
-
 
 def coerce_bool(df: pd.DataFrame, col: str = "posted", out_col: Optional[str] = None) -> pd.DataFrame:
     """Normalize a yes/no style column to boolean True/False/NA."""
@@ -349,7 +271,6 @@ def coerce_bool(df: pd.DataFrame, col: str = "posted", out_col: Optional[str] = 
     s = out[col].astype("string").str.strip().str.lower().fillna("")
     out[out_col] = s.map(lambda v: True if v in true_vals else (False if v in false_vals else pd.NA))
     return out
-
 
 def make_amount_signed(
     df: pd.DataFrame,
@@ -374,7 +295,6 @@ def make_amount_signed(
     out[out_col] = out.apply(sign_row, axis=1)
     return out
 
-
 def fill_unknowns(df: pd.DataFrame, cols: Iterable[str] = ("category_norm", "payment_method_norm")) -> pd.DataFrame:
     """Fill blanks/NaNs with 'misc' so charts and groupbys don't choke."""
     out = df.copy()
@@ -383,7 +303,6 @@ def fill_unknowns(df: pd.DataFrame, cols: Iterable[str] = ("category_norm", "pay
             out[c] = out[c].fillna("misc")
             out.loc[out[c].astype("string").str.strip().eq(""), c] = "misc"
     return out
-
 
 def report_mapped_unmapped(df: pd.DataFrame) -> None:
     """Print mapped pairs and unmapped raw values (to extend dictionaries)."""
@@ -412,7 +331,7 @@ def report_mapped_unmapped(df: pd.DataFrame) -> None:
 # Validation, buckets, enforcement
 # -------------------------------------------------------------------
 
-REQUIRED_COLS = {"date", "type", "amount"}
+REQUIRED_COLS = set(RAW_REQUIRED)
 
 def validate_ledger(df: pd.DataFrame) -> None:
     """Check required cols, missing values, and duplicates."""
@@ -428,7 +347,7 @@ def apply_bucket(df: pd.DataFrame, cat_col: str = "category_norm", out_col: str 
     """Map category_norm/type_norm into a coarse bucket: needs/wants/savings/taxes/income."""
     out = df.copy()
     if cat_col in out.columns:
-        out[out_col] = out[cat_col].map(lambda v: BUCKET_MAP.get(str(v), "wants"))
+        out[out_col] = out[cat_col].map(lambda v: BUCKET_RULES.get(str(v), "wants"))
     if "type_norm" in out.columns:
         out.loc[out["type_norm"].eq("income"), out_col] = "income"
     return out
@@ -462,21 +381,23 @@ def _collect_violations(df: pd.DataFrame) -> Tuple[List[str], pd.DataFrame]:
 
     # Category must be canonical
     if "category_norm" in df.columns:
-        bad_cat = df[~df["category_norm"].isin(CATEGORY_ALLOWED)]
+        allowed_cats = set(CATEGORY_MAP.values()) | {"misc"}
+        bad_cat = df[~df["category_norm"].isin(allowed_cats)]
         if not bad_cat.empty:
-            msgs.append(f"- {len(bad_cat)} rows have invalid category_norm (allowed: {sorted(CATEGORY_ALLOWED)})")
+            msgs.append(f"- {len(bad_cat)} rows have invalid category_norm (allowed: {sorted(allowed_cats)})")
             for v in bad_cat["category_norm"].dropna().unique():
-                suggestion = _closest(str(v), CATEGORY_ALLOWED, n=1)
+                suggestion = _closest(str(v), allowed_cats, n=1)
                 if suggestion:
                     suggestions_rows.append(("category_norm", str(v), suggestion[0]))
 
     # Payment method must be canonical if present
     if "payment_method_norm" in df.columns:
-        bad_pm = df[~df["payment_method_norm"].isin(PAYMENT_ALLOWED)]
+        allowed_pm = set(PAYMENT_METHOD_MAP.values())
+        bad_pm = df[~df["payment_method_norm"].isin(allowed_pm)]
         if not bad_pm.empty:
-            msgs.append(f"- {len(bad_pm)} rows have invalid payment_method_norm (allowed: {sorted(PAYMENT_ALLOWED)})")
+            msgs.append(f"- {len(bad_pm)} rows have invalid payment_method_norm (allowed: {sorted(allowed_pm)})")
             for v in bad_pm["payment_method_norm"].dropna().unique():
-                suggestion = _closest(str(v), PAYMENT_ALLOWED, n=1)
+                suggestion = _closest(str(v), allowed_pm, n=1)
                 if suggestion:
                     suggestions_rows.append(("payment_method_norm", str(v), suggestion[0]))
 
@@ -512,11 +433,13 @@ def enforce_schema(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
 
 def clean_ledger(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
     """Run full cleaning pipeline, return ready-to-analyze frame."""
-    # 1) normalize headers, validate minimal shape
+    # 1) normalize headers, alias, ensure shape
     df1 = normalize_columns(df)
+    df1 = apply_header_aliases(df1)
+    df1 = ensure_required_optional(df1)
     validate_ledger(df1)
 
-    # 2) non-destructive text normalization (adds *_norm for text cols, fixes typos in known fields)
+    # 2) non-destructive text normalization (adds *_norm for text cols, fixes typos)
     df2 = lowercase_strings(df1, make_norm_cols=True)
 
     # 3) type normalization and numeric/date coercions
@@ -524,15 +447,15 @@ def clean_ledger(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
     df4 = coerce_amount(df3, col="amount", out_col="amount_num")
     df5 = coerce_date(df4, col="date", out_col="date_dt")
 
-    # 4) posted flag
+    # 4) posted flag (robust if raw missing)
     if "posted" in df5.columns:
         df5 = coerce_bool(df5, col="posted", out_col="posted_bool")
 
-    # 5) category & payment canonicalization to stable buckets (overwrite *_norm with canonical values)
+    # 5) category & payment canonicalization (overwrite *_norm with canonical values)
     if "category" in df5.columns:
         df5 = normalize_simple(df5, "category", CATEGORY_MAP, "category_norm")
     if "payment_method" in df5.columns:
-        df5 = normalize_simple(df5, "payment_method", PAYMENT_MAP, "payment_method_norm")
+        df5 = normalize_simple(df5, "payment_method", PAYMENT_METHOD_MAP, "payment_method_norm")
     df5 = fill_unknowns(df5)
 
     # 6) signed amounts
@@ -541,8 +464,17 @@ def clean_ledger(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
     # 7) Needs/Wants/Savings/Taxes bucket
     df7 = apply_bucket(df6)
 
-    # 8) mapped/unmapped reports and schema enforcement
+    # 8) finalize 'posted' column (prefer posted_bool if created). If missing entirely, assume True.
+    if "posted_bool" in df7.columns:
+        df7["posted"] = df7["posted_bool"].fillna(True)
+    elif "posted" not in df7.columns:
+        df7["posted"] = True
+
+    # 9) mapped/unmapped reports and schema enforcement
     report_mapped_unmapped(df7)
     df7 = enforce_schema(df7, strict=strict)
 
-    return df7
+    # 10) final ordering (keep extras at end)
+    ordered = [c for c in CLEAN_HEADERS if c in df7.columns]
+    rest = [c for c in df7.columns if c not in ordered]
+    return df7[ordered + rest]

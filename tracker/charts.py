@@ -1,267 +1,364 @@
-# tracker/charts.py
-# Charts: daily net, running balance, expenses by category (pie)
-# Uses ONLY cleaned/normalized columns: date_dt, amount_num, type_norm, category_norm, amount_signed
+# tracker/clean.py
+# Unified cleaning utilities for Finance-Tracker
+# - Header normalization + aliasing (from mappings.py)
+# - Text cleanup + typo fixes (from mappings.py)
+# - Type/category/payment canonicalization (schema-driven)
+# - Date/amount coercion
+# - Posted -> boolean (robust even if raw missing)
+# - Signed amounts (+ income, − expense)
+# - Needs/Wants/Savings/Taxes bucket
+# - Validation + closest-match suggestions
+# - Final column ordering (CLEAN_HEADERS first, extras preserved)
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-from typing import Optional
+import re
+import difflib
+from datetime import datetime
+from typing import Optional, Iterable, Mapping, Dict, List, Tuple, Any
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+
+# === central schema + mappings ===
+from .schema import (
+    RAW_REQUIRED,
+    RAW_OPTIONAL_DEFAULTS,
+    VALUE_DOMAINS,
+    CLEAN_HEADERS,
+)
+from .mappings import (
+    HEADER_ALIASES,
+    TYPE_MAP,
+    CATEGORY_MAP,
+    PAYMENT_METHOD_MAP,
+    SPELLING_FIXES,
+    BUCKET_RULES,
+)
+
+__all__ = [
+    "normalize_columns",
+    "apply_header_aliases",
+    "ensure_required_optional",
+    "lowercase_strings",
+    "normalize_type",
+    "coerce_date",
+    "coerce_amount",
+    "normalize_simple",
+    "coerce_bool",
+    "make_amount_signed",
+    "fill_unknowns",
+    "report_mapped_unmapped",
+    "validate_ledger",
+    "apply_bucket",
+    "clean_doordash_data",
+    "clean_ledger",
+]
+
+# =========================
+# 1) Column header normalization
+# =========================
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardize column headers: lowercase, snake_case, no special chars.
+    """
+    out = df.copy()
+    out.columns = (
+        pd.Index(out.columns)
+        .str.lower()
+        .str.strip()
+        .str.replace(r"[^a-z0-9_]+", "", regex=True)
+        .str.replace(r"\s+", "_", regex=True)
+    )
+    return out
 
 
-# --------------------------
-# Utilities
-# --------------------------
+def apply_header_aliases(df: pd.DataFrame, aliases: Mapping[str, str]) -> pd.DataFrame:
+    """
+    Rename columns based on a mapping of common aliases -> canonical names.
+    """
+    return df.rename(columns=aliases)
 
-REQUIRED_BASE = {"date_dt", "amount_num", "type_norm", "category_norm"}
 
-def _ensure_outdir(path: str | os.PathLike) -> Path:
-    p = Path(path)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-def _require_cols(df: pd.DataFrame, cols: set[str]) -> None:
-    missing = cols - set(df.columns)
+# =========================
+# 2) DataFrame shape/schema
+# =========================
+def ensure_required_optional(
+    df: pd.DataFrame,
+    required: Iterable[str],
+    optional_defaults: Mapping[str, Any],
+) -> pd.DataFrame:
+    """
+    Ensure all required columns are present; add optional columns with defaults if missing.
+    """
+    out = df.copy()
+    missing = set(required) - set(out.columns)
     if missing:
-        raise ValueError(f"Missing required columns for charts: {sorted(missing)}")
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-def _ensure_amount_signed(df: pd.DataFrame) -> pd.Series:
-    """Return amount_signed; compute on the fly if missing."""
-    if "amount_signed" in df.columns:
-        return df["amount_signed"].astype(float)
-    # Compute from amount_num + type_norm
-    sign = np.where(df["type_norm"].astype(str).str.lower().eq("income"), 1.0,
-                    np.where(df["type_norm"].astype(str).str.lower().eq("expense"), -1.0, 1.0))
-    return df["amount_num"].astype(float) * sign
+    for col, default in optional_defaults.items():
+        if col not in out.columns:
+            out[col] = default
+    return out
 
-def _clean_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """Safe copy, drop NAs in date, coerce types, and ensure normalized columns exist."""
-    _require_cols(df, REQUIRED_BASE)
+
+# =========================
+# 3) Value coercion / cleanup
+# =========================
+def lowercase_strings(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Lowercase and strip all string columns.
+    """
+    out = df.copy()
+    for c in out.select_dtypes(include=["object", "string"]).columns:
+        out[c] = out[c].astype(str).str.lower().str.strip()
+    return out
+
+
+def normalize_type(
+    df: pd.DataFrame, col: str, out_col: str, type_map: Mapping[str, str]
+) -> pd.DataFrame:
+    """
+    Normalize the 'type' column to canonical values (income/expense/transfer).
+    """
+    out = df.copy()
+    if col in out.columns:
+        out[out_col] = out[col].map(type_map)
+    return out
+
+
+def coerce_date(df: pd.DataFrame, col: str, out_col: str) -> pd.DataFrame:
+    """
+    Coerce a date column to datetime objects, handling various formats.
+    """
+    out = df.copy()
+    if col in out.columns:
+        out[out_col] = pd.to_datetime(out[col], errors="coerce")
+    return out
+
+
+def coerce_amount(df: pd.DataFrame, col: str, out_col: str) -> pd.DataFrame:
+    """
+    Coerce an amount column to numeric, handling $, commas, and parentheses for negatives.
+    """
+    out = df.copy()
+    if col in out.columns:
+        s = out[col].astype(str).str.strip()
+        s = s.str.replace(r"[\$,]", "", regex=True)
+        s = s.str.replace(r"\((.*)\)", r"-\1", regex=True)
+        out[out_col] = pd.to_numeric(s, errors="coerce")
+    return out
+
+
+def normalize_simple(
+    df: pd.DataFrame, col: str, mapping: Mapping[str, str], out_col: str
+) -> pd.DataFrame:
+    """
+    Apply a simple key-value mapping to a column for canonicalization.
+    """
+    out = df.copy()
+    if col in out.columns:
+        out[out_col] = out[col].map(mapping).fillna(out[col])
+    return out
+
+
+def coerce_bool(df: pd.DataFrame, col: str, out_col: str) -> pd.DataFrame:
+    """
+    Coerce a column to boolean, mapping common string values.
+    """
+    out = df.copy()
+    if col in out.columns:
+        s = out[col].astype(str).str.strip().str.lower()
+        true_vals = {"true", "t", "yes", "y", "1", "paid", "posted"}
+        out[out_col] = s.isin(true_vals)
+    return out
+
+
+# =========================
+# 4) Derived columns
+# =========================
+def make_amount_signed(
+    df: pd.DataFrame, amount_col: str, type_col: str, out_col: str
+) -> pd.DataFrame:
+    """
+    Create a signed amount column (+ for income, - for expense).
+    """
+    out = df.copy()
+    if amount_col in out.columns and type_col in out.columns:
+        sign = np.where(out[type_col] == "income", 1, -1)
+        out[out_col] = out[amount_col].abs() * sign
+    return out
+
+
+def fill_unknowns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fill NaNs in key normalized columns with placeholder values.
+    """
+    out = df.copy()
+    if "category_norm" in out.columns:
+        out["category_norm"] = out["category_norm"].fillna("misc")
+    if "payment_method_norm" in out.columns:
+        out["payment_method_norm"] = out["payment_method_norm"].fillna("unknown")
+    return out
+
+
+def apply_bucket(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply Needs/Wants/Savings/Taxes bucket based on category and type.
+    """
     out = df.copy()
 
-    # Coerce types
-    out["date_dt"] = pd.to_datetime(out["date_dt"], errors="coerce")
-    out["amount_num"] = pd.to_numeric(out["amount_num"], errors="coerce")
-    out["type_norm"] = out["type_norm"].astype("string").str.lower().str.strip()
-    out["category_norm"] = out["category_norm"].astype("string").str.lower().str.strip()
+    def get_bucket(row):
+        cat = row.get("category_norm", "")
+        typ = row.get("type_norm", "")
+        if typ == "income":
+            return "income"
+        for bucket, keywords in BUCKET_RULES.items():
+            if cat in keywords:
+                return bucket
+        return "wants"  # Default for expenses
 
-    # Drop rows without usable date or amount
-    out = out.dropna(subset=["date_dt", "amount_num"])
-
-    # Ensure amount_signed
-    out["amount_signed"] = _ensure_amount_signed(out)
-
-    # Fill blanks to avoid groupby issues
-    out["category_norm"] = out["category_norm"].replace("", "misc").fillna("misc")
-    out["type_norm"] = out["type_norm"].replace("", pd.NA)
-
+    if "category_norm" in out.columns and "type_norm" in out.columns:
+        out["bucket"] = out.apply(get_bucket, axis=1)
     return out
 
 
-# --------------------------
-# Chart rendering
-# --------------------------
+# =========================
+# 5) Validation / reporting
+# =========================
+def get_closest_match(
+    value: str, allowed_values: Iterable[str], n: int = 1, cutoff: float = 0.6
+) -> Optional[str]:
+    """
+    Find the closest match for a value from a list of allowed values.
+    """
+    matches = difflib.get_close_matches(value, allowed_values, n=n, cutoff=cutoff)
+    return matches[0] if matches else None
 
-def plot_daily_net(df: pd.DataFrame, outdir: Path) -> Path:
-    """Bar chart of daily net (sum of amount_signed per date)."""
-    d = _clean_frame(df)
 
-    daily = (
-        d.groupby(d["date_dt"].dt.date, dropna=False)["amount_signed"]
-        .sum()
-        .sort_index()
+def report_mapped_unmapped(
+    df: pd.DataFrame, col: str, mapping: Mapping[str, str], title: str
+) -> None:
+    """
+    Report on values in a column that were successfully mapped or remain unmapped.
+    """
+    s = df[col].dropna().unique()
+    mapped = {k for k in s if k in mapping}
+    unmapped = set(s) - mapped
+    print(f"\n--- {title} ---")
+    if mapped:
+        print(f"  Mapped values ({len(mapped)}): {sorted(mapped)}")
+    if unmapped:
+        print(f"  Unmapped values ({len(unmapped)}):")
+        for val in sorted(unmapped):
+            suggestion = get_closest_match(val, mapping.keys())
+            hint = f" (did you mean '{suggestion}'?)" if suggestion else ""
+            print(f"    - {val}{hint}")
+
+
+def validate_ledger(df: pd.DataFrame) -> None:
+    """
+    Run a series of validation checks on the cleaned ledger.
+    """
+    print("\n[VALIDATION] Missing values per column:")
+    print(df.isna().sum())
+
+    # Report on unmapped values for key columns
+    print("\n[UNMAPPED] category values (top 20):")
+    print(df["category"].value_counts().nlargest(20))
+    print("\n[UNMAPPED] source values (top 20):")
+    print(df["source"].value_counts().nlargest(20))
+
+    # Schema validation against VALUE_DOMAINS
+    print("\n[SCHEMA] Issues detected:")
+    has_issues = False
+    for col, allowed in VALUE_DOMAINS.items():
+        if f"{col}_norm" in df.columns:
+            invalid = df[~df[f"{col}_norm"].isin(allowed) & df[f"{col}_norm"].notna()]
+            if not invalid.empty:
+                has_issues = True
+                print(f"- {len(invalid)} rows have invalid {col}_norm (allowed: {allowed})")
+    if not has_issues:
+        print("- No schema issues found.")
+
+
+# =========================
+# 6) Main cleaning pipeline
+# =========================
+def clean_doordash_data(df_doordash: pd.DataFrame, df_goals: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cleans and processes the DoorDash DataFrame.
+    """
+    # Placeholder for DoorDash-specific cleaning logic
+    return df_doordash
+
+def clean_ledger(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    The main cleaning pipeline function.
+    Takes a dictionary of DataFrames, merges them, and applies all cleaning steps.
+    """
+    # --- FIX STARTS HERE ---
+    # Extract the main DataFrame from the dictionary.
+    # It could be 'Ledger', 'merged', or the only one present.
+    if "merged" in dfs:
+        df = dfs["merged"].copy()
+    elif "Ledger" in dfs:
+        df = dfs["Ledger"].copy()
+    elif len(dfs) == 1:
+        df = list(dfs.values())[0].copy()
+    else:
+        # If we can't find a primary DataFrame, start with an empty one.
+        # This prevents crashes if e.g. the 'Ledger' tab is missing.
+        df = pd.DataFrame()
+
+    if df.empty:
+        print("⚠️ Warning: No data found to clean.")
+        return df
+    # --- FIX ENDS HERE ---
+
+    # 1) headers
+    df1 = normalize_columns(df)
+    df1 = apply_header_aliases(df1, HEADER_ALIASES)
+    df1 = ensure_required_optional(
+        df1, required=RAW_REQUIRED, optional_defaults=RAW_OPTIONAL_DEFAULTS
     )
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    daily.plot(kind="bar", ax=ax)
-    ax.set_title("Daily Net")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Net ($)")
-    ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
+    # 2) global text cleanup (lowercase, strip, simple typo fixes)
+    df2 = lowercase_strings(df1)
+    for col in df2.select_dtypes(include=["object", "string"]).columns:
+        df2[col] = df2[col].replace(SPELLING_FIXES)
 
-    outpath = outdir / "daily_net.png"
-    fig.savefig(outpath, dpi=144)
-    plt.close(fig)
-    return outpath
+    # 3) core value coercions
+    df3 = normalize_type(df2, col="type", out_col="type_norm", type_map=TYPE_MAP)
+    df4 = coerce_amount(df3, col="amount", out_col="amount_num")
+    df5 = coerce_date(df4, col="date", out_col="date_dt")
 
+    # 4) posted flag (robust if raw missing)
+    if "posted" in df5.columns:
+        df5 = coerce_bool(df5, col="posted", out_col="posted_bool")
 
-def plot_running_balance(df: pd.DataFrame, outdir: Path, starting_balance: float = 0.0) -> Path:
-    """Line chart of running balance over time (cumulative sum of amount_signed)."""
-    d = _clean_frame(df).sort_values("date_dt")
+    # 5) category & payment canonicalization (overwrite *_norm with canonical values)
+    if "category" in df5.columns:
+        df5 = normalize_simple(df5, "category", CATEGORY_MAP, "category_norm")
+    if "payment_method" in df5.columns:
+        df5 = normalize_simple(df5, "payment_method", PAYMENT_METHOD_MAP, "payment_method_norm")
+    df5 = fill_unknowns(df5)
 
-    daily = (
-        d.groupby(d["date_dt"].dt.date, dropna=False)["amount_signed"]
-        .sum()
-        .sort_index()
-        .astype(float)
-    )
-    running = daily.cumsum() + float(starting_balance)
+    # 6) signed amounts
+    df6 = make_amount_signed(df5, amount_col="amount_num", type_col="type_norm", out_col="amount_signed")
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    running.plot(ax=ax)
-    ax.set_title("Running Balance")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Balance ($)")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    # 7) Needs/Wants/Savings/Taxes bucket
+    df7 = apply_bucket(df6)
 
-    outpath = outdir / "running_balance.png"
-    fig.savefig(outpath, dpi=144)
-    plt.close(fig)
-    return outpath
+    # 8) finalize 'posted' column (prefer posted_bool if created). If missing entirely, assume True.
+    if "posted_bool" in df7.columns:
+        df7["posted"] = df7["posted_bool"].fillna(True)
+    elif "posted" not in df7.columns:
+        df7["posted"] = True # Assume posted if no column exists
 
+    # 9) final column selection and ordering
+    final_cols = [c for c in CLEAN_HEADERS if c in df7.columns]
+    extra_cols = [c for c in df7.columns if c not in CLEAN_HEADERS]
+    
+    return df7[final_cols + extra_cols]
 
-def plot_expenses_pie(df: pd.DataFrame, outdir: Path, min_slice_pct: float = 2.0) -> Path:
-    """
-    Pie chart of total expenses by category (uses only rows where type_norm == 'expense').
-    Uses positive magnitudes for readability.
-    Small slices are grouped into 'other' if below min_slice_pct (% of total).
-    """
-    d = _clean_frame(df)
-    exp = d[d["type_norm"].eq("expense")].copy()
-    if exp.empty:
-        # Create an empty placeholder chart so the file still exists.
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.text(0.5, 0.5, "No expense data", ha="center", va="center")
-        ax.axis("off")
-        outpath = outdir / "expenses_pie.png"
-        fig.savefig(outpath, dpi=144)
-        plt.close(fig)
-        return outpath
-
-    # Use magnitudes for expenses (amount_signed is negative for expenses)
-    exp["value"] = exp["amount_signed"].abs()
-
-    by_cat = (
-        exp.groupby("category_norm", dropna=False)["value"]
-        .sum()
-        .sort_values(ascending=False)
-    )
-
-    total = by_cat.sum()
-    if total <= 0:
-        # Avoid divide-by-zero; just emit placeholder
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.text(0.5, 0.5, "No expense totals", ha="center", va="center")
-        ax.axis("off")
-        outpath = outdir / "expenses_pie.png"
-        fig.savefig(outpath, dpi=144)
-        plt.close(fig)
-        return outpath
-
-    # Combine very small slices into "other"
-    pct = (by_cat / total) * 100.0
-    large = pct[pct >= float(min_slice_pct)]
-    small = pct[pct < float(min_slice_pct)]
-    if not small.empty:
-        large["other"] = small.sum()
-        by_cat = large.sort_values(ascending=False) * (total / 100.0)
-
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    ax.pie(by_cat.values, labels=by_cat.index, autopct="%1.1f%%", startangle=90)
-    ax.set_title("Expenses by Category")
-    fig.tight_layout()
-
-    outpath = outdir / "expenses_pie.png"
-    fig.savefig(outpath, dpi=144)
-    plt.close(fig)
-    return outpath
-
-
-# --------------------------
-# Public entrypoint
-# --------------------------
-
-def render_all(df: pd.DataFrame, outdir: str | os.PathLike = "charts", starting_balance: float = 0.0) -> dict[str, Path]:
-    """
-    Render all milestone charts using normalized columns.
-    Returns dict of chart name -> path.
-    """
-    od = _ensure_outdir(outdir)
-    out = {}
-    out["daily_net"] = plot_daily_net(df, od)
-    out["running_balance"] = plot_running_balance(df, od, starting_balance=starting_balance)
-    out["expenses_pie"] = plot_expenses_pie(df, od)
-    return out
-
-# --------------------------
-# Optional helpers for tracker_api.py
-# --------------------------
-
-def _month_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return monthly totals with columns: month, income, expense, net.
-    Uses normalized columns: date_dt, amount_num, type_norm.
-    """
-    d = _clean_frame(df).copy()
-    if d.empty:
-        return pd.DataFrame(columns=["month", "income", "expense", "net"])
-
-    d["month"] = d["date_dt"].dt.to_period("M").dt.to_timestamp()
-
-    inc = d[d["type_norm"].eq("income")].groupby("month")["amount_num"].sum().rename("income")
-    exp = d[d["type_norm"].eq("expense")].groupby("month")["amount_num"].sum().rename("expense")
-
-    out = pd.concat([inc, exp], axis=1).fillna(0.0).reset_index()
-    # expenses are positive magnitudes above; net = income - expense
-    out["net"] = out["income"] - out["expense"]
-    out = out.sort_values("month")
-    return out
-
-
-def extra_charts(df: pd.DataFrame, outdir: str | os.PathLike = "charts") -> None:
-    """
-    Optional charts:
-      - Monthly net (bar)
-      - Expenses by payment method (pie) if payment_method_norm exists
-      - Bucket pie (if 'bucket' exists)
-    """
-    od = _ensure_outdir(outdir)
-    d = _clean_frame(df)
-
-    # 1) Monthly net
-    mf = _month_frame(d)
-    if not mf.empty:
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.bar(mf["month"].dt.strftime("%Y-%m"), mf["net"])
-        ax.set_title("Monthly Net")
-        ax.set_xlabel("Month")
-        ax.set_ylabel("Net ($)")
-        plt.xticks(rotation=45, ha="right")
-        ax.grid(True, axis="y", alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(Path(od) / "monthly_net.png", dpi=144)
-        plt.close(fig)
-
-    # 2) Expenses by payment method (optional)
-    if "payment_method_norm" in d.columns:
-        exp = d[d["type_norm"].eq("expense")].copy()
-        if not exp.empty:
-            exp["value"] = exp["amount_signed"].abs()
-            pm = exp.groupby("payment_method_norm")["value"].sum().sort_values(ascending=False)
-            if not pm.empty:
-                fig, ax = plt.subplots(figsize=(7, 7))
-                ax.pie(pm.values, labels=pm.index, autopct="%1.1f%%", startangle=90)
-                ax.set_title("Expenses by Payment Method")
-                fig.tight_layout()
-                fig.savefig(Path(od) / "expenses_by_payment_method.png", dpi=144)
-                plt.close(fig)
-
-    # 3) Bucket pie (optional)
-    if "bucket" in d.columns:
-        exp = d[d["type_norm"].eq("expense")].copy()
-        if not exp.empty:
-            exp["value"] = exp["amount_signed"].abs()
-            by_bucket = exp.groupby("bucket")["value"].sum().sort_values(ascending=False)
-            if not by_bucket.empty:
-                fig, ax = plt.subplots(figsize=(7, 7))
-                ax.pie(by_bucket.values, labels=by_bucket.index, autopct="%1.1f%%", startangle=90)
-                ax.set_title("Expenses by Bucket")
-                fig.tight_layout()
-                fig.savefig(Path(od) / "expenses_by_bucket.png", dpi=144)
-                plt.close(fig)

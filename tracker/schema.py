@@ -1,55 +1,29 @@
-# tracker/mappings.py
+# tracker/schema.py
+from typing import Mapping, Iterable, List, Dict, Any
+# This file is a central repository for the schema and mappings
+# It should be imported by other modules to ensure consistency.
 
-# Header aliases: messy/raw column names -> raw canonical
-HEADER_ALIASES = {
-    "amount ($)": "amount",
-    "payment method": "payment_method",
-    "pay_method": "payment_method",
-    "posted?": "posted",
-    "desc": "description",
-    # add as you find more
+# Raw columns required in the input data
+RAW_REQUIRED: List[str] = ["date", "type", "amount"]
+
+# Raw optional columns and their default values
+RAW_OPTIONAL_DEFAULTS: Dict[str, Any] = {
+    "category": "misc",
+    "description": "",
+    "source": "",
+    "posted": "true",
+    "name": ""
 }
 
-# Normalization maps (values)
-TYPE_MAP = {
-    "income": "income", "in": "income", "pay": "income", "salary": "income",
-    "expense": "expense", "exp": "expense", "bill": "expense",
-}
+# Final canonical headers for the cleaned output dataframe
+CLEAN_HEADERS: List[str] = [
+    "date_dt", "amount_signed", "amount_num", "type_norm", "category_norm",
+    "description_norm", "source_norm", "payment_method_norm", "bucket", "posted",
+]
 
-# Common typos & canonicalization (low-stakes spelling)
-SPELLING_FIXES = {
-    "woek": "work",
-    "doodash": "doordash",
-    "grocceries": "groceries",
-    "discover ": "discover",
-}
-
-# Category normalization (raw -> stable)
-CATEGORY_MAP = {
-    "doodash": "doordash",
-    "dd": "doordash",
-    "grocceries": "groceries",
-    "rent ": "rent",
-    "gasoline": "gas",
-    # extend as you see real data
-}
-
-# Payment method normalization
-PAYMENT_METHOD_MAP = {
-    "deb": "debit",
-    "debt": "debit",
-    "ach ": "ach",
-    "cashapp": "cash_app",
-    "cash app": "cash_app",
-}
-
-# Simple bucket rules (can move to regex later)
-BUCKET_RULES = {
-    "rent": "Needs",
-    "groceries": "Needs",
-    "gas": "Needs",
-    "spire": "Needs",
-    "phone": "Needs",
-    "weed": "Wants",
-    "doordash": "Income",
+# A canonical mapping of text values to their normalized forms
+VALUE_DOMAINS: Dict[str, List[str]] = {
+    "type": ["income", "expense", "transfer"],
+    "bucket": ["income", "needs", "wants", "savings", "taxes"],
+    # Add more domains for validation as needed
 }

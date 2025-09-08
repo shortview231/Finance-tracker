@@ -8,8 +8,8 @@ from typing import Tuple, List, Dict, Any
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from tracker.clean import clean_ledger, validate_ledger
-from tracker.io import read_ledger_from_sheets  # (write_df_to_sheet used lazily)
+from tracker.clean import clean_ledger, validate_ledger, clean_doordash_data
+from tracker.io import read_sheets_to_dfs, write_df_to_sheet
 
 # Optional extras from tracker.charts; safe if not present
 try:
@@ -17,6 +17,9 @@ try:
 except Exception:
     extra_charts = None
     _month_frame = None
+
+# Demo redaction toggle for public scenarios (weed -> medicine)
+DEMO_REDACT_CATEGORIES = True
 
 # Paths
 CHARTS_DIR = Path("charts")
@@ -31,11 +34,34 @@ CLEANED_PREVIEW_CSV = CHARTS_DIR / "cleaned_preview.csv"
 # --------------------------
 # Helpers
 # --------------------------
+def _merge_dfs(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Merges all DataFrames into a single, comprehensive DataFrame for analysis.
+    """
+    df_ledger = dfs.get("Ledger", pd.DataFrame())
+    df_expenses = dfs.get("Expenses", pd.DataFrame())
+    df_doordash = dfs.get("DoorDash", pd.DataFrame())
+    df_goals = dfs.get("Goals", pd.DataFrame())
+    
+    # 1. Clean the DoorDash data
+    if not df_doordash.empty and not df_goals.empty:
+        df_doordash = clean_doordash_data(df_doordash, df_goals)
+    
+    # 2. Add a 'type' column to the DoorDash data
+    if not df_doordash.empty:
+        df_doordash['type'] = 'income'
+
+    # 3. Merge the Ledger and DoorDash data
+    df_merged = pd.concat([df_ledger, df_doordash], ignore_index=True)
+    
+    return df_merged
+
+
 def _load_clean_df(prefer_csv: bool = True) -> pd.DataFrame:
     """
     Load a cleaned dataframe:
       - if charts/cleaned_preview.csv exists and prefer_csv=True, load it;
-      - else read raw ledger from Sheets and run clean_ledger.
+      - else read raw data from Sheets and run clean_ledger.
     Ensures: date_dt, type_norm, amount_num, amount_signed (and category_norm if available).
     """
     if prefer_csv and CLEANED_PREVIEW_CSV.exists():
@@ -53,10 +79,17 @@ def _load_clean_df(prefer_csv: bool = True) -> pd.DataFrame:
             s = df["posted"].astype(str).str.strip().str.lower()
             df["posted"] = s.isin({"true", "t", "yes", "y", "1", "paid"})
         return df
-
-    print("ℹ️ No cleaned_preview.csv (or bypassed) — reading raw ledger from Sheets and cleaning.")
-    raw = read_ledger_from_sheets()
-    df = clean_ledger(raw)
+    
+    # Read all sheets into a dictionary of DataFrames
+    print("ℹ️ No cleaned_preview.csv (or bypassed) — reading all ledgers from Sheets and cleaning.")
+    raw_dfs = read_sheets_to_dfs(
+        tab_names=["Ledger", "Expenses", "DoorDash", "Goals"]
+    )
+    
+    merged_df = _merge_dfs(raw_dfs)
+    
+    df = clean_ledger(merged_df)
+    
     return df
 
 
@@ -91,6 +124,229 @@ def _posted_mask(df: pd.DataFrame) -> pd.Series:
 
 
 # --------------------------
+# DEMO DATA GENERATION HELPERS
+# --------------------------
+# Realism helpers
+from datetime import date, timedelta
+import numpy as np
+
+
+def _demo_rng():
+    # Stable randomness per run without affecting global numpy state
+    return np.random.default_rng(20250908)
+
+
+def _closest_friday_if_weekend(d: date) -> date:
+    # Simple weekend rule; holiday list can be added later
+    if d.weekday() in (5, 6):
+        while d.weekday() != 4:
+            d -= timedelta(days=1)
+    return d
+
+
+def _recurring_bills(year: int, month: int) -> List[Dict[str, Any]]:
+    # Fixed bills with categories that already exist in your mappings
+    bills = [
+        {"day": 1,  "desc": "Rent",       "category": "rent",  "amount": -850, "source": "landlord"},
+        {"day": 12, "desc": "Utilities",  "category": "spire", "amount": -120, "source": "spire"},
+        {"day": 15, "desc": "Phone Bill", "category": "phone", "amount": -75,  "source": "carrier"},
+        {"day": 18, "desc": "Streaming",  "category": "misc",  "amount": -16,  "source": "netflix"},
+    ]
+    rows: List[Dict[str, Any]] = []
+    for b in bills:
+        try:
+            d = date(year, month, b["day"])
+        except ValueError:
+            continue
+        rows.append({
+            "date": d.isoformat(),
+            "type": "expense",
+            "category": b["category"],
+            "description": b["desc"],
+            "amount": float(b["amount"]),
+            "source": b["source"],
+            "posted": "true",
+        })
+    return rows
+
+
+def _disability_income_row(year: int, month: int, amount: float = 1200.0) -> Dict[str, Any]:
+    base = date(year, month, 3)
+    pay_day = _closest_friday_if_weekend(base)
+    return {
+        "date": pay_day.isoformat(),
+        "type": "income",
+        "category": "disability",
+        "description": "Disability deposit",
+        "amount": float(amount),
+        "source": "ssa",
+        "posted": "true",
+    }
+
+
+def _random_day_transactions(year: int, month: int, d: int, income_level: str, rng: np.random.Generator) -> List[Dict[str, Any]]:
+    """Produce 0–6 transactions for a single day with varied amounts/categories."""
+    try:
+        dt = date(year, month, d)
+    except ValueError:
+        return []
+
+    # Poisson-like draw for count, then clamp
+    n = int(rng.poisson(2))
+    n = max(0, min(n, 6))
+
+    # income baselines by level
+    income_base = {"low": 45, "medium": 110, "high": 200}[income_level]
+    exp_mu = {"low": 18, "medium": 28, "high": 42}[income_level]  # typical expense
+
+    cats_expense = [
+        ("groceries", 0.25, ["Groceries", "Food run", "Market haul"], ["debit card", "discover", "visa"]),
+        ("gas",       0.20, ["Gas", "Fuel"],                            ["debit card", "discover"]),
+        ("dining",    0.15, ["Coffee", "Snacks", "Lunch out"],          ["debit card", "visa"]),
+        ("medicine",  0.05, ["Pharmacy"],                                 ["debit card"]),  # demo safe
+        ("misc",      0.35, ["Supplies", "Errand", "Misc"],             ["debit card", "cash"]),
+    ]
+
+    rows: List[Dict[str, Any]] = []
+    for _ in range(n):
+        # mix of income and expenses
+        is_income = rng.random() < 0.25  # 25 percent chance income-like
+        if is_income:
+            # noisy gig payout
+            amt = income_base + rng.normal(0, income_base * 0.25)
+            amt = round(max(15, amt), 2)
+            rows.append({
+                "date": dt.isoformat(),
+                "type": "income",
+                "category": "doordash",
+                "description": "Gig payout",
+                "amount": float(amt),
+                "source": "doordash",
+                "posted": "true",
+            })
+        else:
+            # choose an expense category by weight
+            p = rng.random()
+            cum = 0.0
+            chosen = cats_expense[-1]
+            for c in cats_expense:
+                cum += c[1]
+                if p <= cum:
+                    chosen = c
+                    break
+            cat, _, descs, sources = chosen
+            # lognormal-ish positive then negated
+            amt = float(max(5, rng.lognormal(mean=float(np.log(exp_mu)), sigma=0.5)))
+            amt = round(-amt, 2)
+            rows.append({
+                "date": dt.isoformat(),
+                "type": "expense",
+                "category": cat,
+                "description": rng.choice(descs),
+                "amount": amt,
+                "source": rng.choice(sources),
+                "posted": "true",
+            })
+    return rows
+
+
+def _redact_demo_categories(df: pd.DataFrame) -> pd.DataFrame:
+    """Demo-only category redaction: show 'weed' as 'medicine' in demos."""
+    if "category" in df.columns:
+        out = df.copy()
+        out["category"] = out["category"].replace({"weed": "medicine"})
+        return out
+    return df
+
+
+def _apply_demo_redaction_if_enabled(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        if DEMO_REDACT_CATEGORIES:
+            return _redact_demo_categories(df)
+    except NameError:
+        pass
+    return df
+
+
+def _generate_realistic_ledger(month_str: str, income_level: str) -> pd.DataFrame:
+    """Central generator used by scenarios and demo data."""
+    rng = _demo_rng()
+    year, m = map(int, month_str.split("-"))
+
+    rows: List[Dict[str, Any]] = []
+    # recurring bills + disability income
+    rows.extend(_recurring_bills(year, m))
+    rows.append(_disability_income_row(year, m, amount=1200.0))
+
+    # per-day random transactions for each day that exists
+    for day in range(1, 32):
+        rows.extend(_random_day_transactions(year, m, day, income_level, rng))
+
+    df = pd.DataFrame(rows)
+
+    # ensure required columns exist even if some lists empty
+    for c in ["date", "type", "category", "amount", "source", "posted", "description"]:
+        if c not in df.columns:
+            df[c] = "" if c != "amount" else 0.0
+
+    # demo-only redaction
+    df = _apply_demo_redaction_if_enabled(df)
+
+    return clean_ledger(df)
+
+
+def _generate_demo_data(start_date: str, income_level: str) -> Dict[str, pd.DataFrame]:
+    """
+    Generates a full set of synthetic data for all sheets.
+    Returns a dictionary of DataFrames.
+    """
+    from datetime import timedelta
+
+    # Ledger: use realistic generator on the month of start_date
+    month_str = pd.to_datetime(start_date).strftime("%Y-%m")
+    ledger_df = _generate_realistic_ledger(month_str, income_level)
+
+    # Expenses table (kept small and static)
+    expenses_data = pd.DataFrame({
+        "expense_name": ["Rent", "Phone Bill", "Netflix"],
+        "amount": [850.00, 75.00, 15.49],
+        "due_date": [1, 15, 18],
+        "status": ["Due", "Due", "Due"],
+    })
+
+    # DoorDash raw orders (optional realism; safe to leave as-is)
+    orders_per_day_mean = 5
+    order_amount_mean = 8
+    order_amount_std = 3
+
+    orders = []
+    current_date = pd.to_datetime(start_date)
+    for i in range(30):  # 30 days
+        num_orders = max(0, int(np.random.normal(orders_per_day_mean, 2)))
+        for j in range(num_orders):
+            order_amount = max(5, np.random.normal(order_amount_mean, order_amount_std))
+            orders.append({
+                "Date": (current_date + timedelta(days=i)).strftime("%Y-%m-%d"),
+                "Order ID": f"DD-{i}-{j}",
+                "Amount": round(float(order_amount), 2),
+            })
+    doordash_data = pd.DataFrame(orders)
+
+    # Goals
+    goals_data = pd.DataFrame({
+        "metric": ["DoorDash Income Cap", "Monthly Savings Goal"],
+        "value": [600, 200],
+    })
+
+    return {
+        "Ledger": ledger_df,
+        "Expenses": expenses_data,
+        "DoorDash": doordash_data,
+        "Goals": goals_data,
+    }
+
+
+# --------------------------
 # CLEAN command
 # --------------------------
 def cmd_clean(
@@ -104,8 +360,9 @@ def cmd_clean(
     Run the full cleaning pipeline and preview results.
     Use --save to persist to CSV or to a Google Sheet tab.
     """
-    raw = read_ledger_from_sheets()
-    dfc = clean_ledger(raw)
+    dfs = read_sheets_to_dfs(tab_names=["Ledger", "Expenses", "DoorDash", "Goals"])
+    merged_df = _merge_dfs(dfs)
+    dfc = clean_ledger(merged_df)
 
     # validation echo (on cleaned frame for a quick sanity view)
     try:
@@ -174,6 +431,7 @@ def cmd_clean(
 # --------------------------
 # CHARTS helpers
 # --------------------------
+
 def _daily_frames_from_clean(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Build daily net and running balance from cleaned columns.
@@ -294,6 +552,7 @@ def _running_balance_overlay(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------
 # CHARTS command
 # --------------------------
+
 def cmd_charts(preview: bool = False):
     df = _load_clean_df(prefer_csv=True)
 
@@ -397,6 +656,7 @@ def cmd_charts(preview: bool = False):
 # --------------------------
 # SYNC-CAL command (previewable)
 # --------------------------
+
 def _preview_calendar_payloads(df: pd.DataFrame, max_rows: int = 10) -> List[Dict[str, Any]]:
     """
     Build preview of calendar event titles from cleaned rows with posted == True (fallback to posted_bool).
@@ -458,42 +718,36 @@ def cmd_sync_cal(dry_run: bool = True):
 # --------------------------
 # SCENARIOS command (previewable)
 # --------------------------
+
 def _synthesize_demo_ledger(month: str, income_level: str) -> pd.DataFrame:
     """
-    Create a tiny synthetic ledger for demo charts.
+    Create a realistic synthetic ledger for demo charts.
     month: 'YYYY-MM' style
     income_level: 'low' | 'medium' | 'high'
     """
-    import numpy as np
-    rng = pd.date_range(f"{month}-01", periods=28, freq="D")
-    base_income = {"low": 50, "medium": 120, "high": 220}[income_level]
-    noise = {"low": 25, "medium": 50, "high": 80}[income_level]
-
-    df = pd.DataFrame({
-        "date": rng.strftime("%Y-%m-%d"),
-        "type": np.where(rng.day % 3 == 0, "income", "expense"),
-        "category": np.where(rng.day % 3 == 0, "gig", np.where(rng.day % 2 == 0, "groceries", "gas")),
-        "amount": np.where(rng.day % 3 == 0, base_income + np.random.randint(-10, 10),
-                           -(noise + np.random.randint(0, 40))),
-        "source": np.where(rng.day % 3 == 0, "demo", ""),
-        "posted": "true",
-    })
-    return clean_ledger(df)
+    return _generate_realistic_ledger(month, income_level)
 
 
 def cmd_scenarios():
     print("📊 Generating demo scenarios (low/medium/high)…")
     for lvl in ("low", "medium", "high"):
         df_demo = _synthesize_demo_ledger("2025-08", lvl)
+        
+        # Write the generated DataFrame to a new tab in the Google Sheet
+        print(f"Writing demo data for '{lvl}' scenario to Google Sheets...")
+        write_df_to_sheet(df_demo, tab_name=f"Demo_Ledger_{lvl}")
+
         daily, run = _daily_frames_from_clean(df_demo)
         _plot_line(daily["date"], daily["net"], f"Daily Net — {lvl.title()}", "Net ($)", CHARTS_DIR / f"daily_net_{lvl}.png")
         _plot_line(run["date"], run["running_balance"], f"Running Balance — {lvl.title()}", "Balance ($)", CHARTS_DIR / f"running_balance_{lvl}.png")
-    print("✅ Scenarios generated to charts/ (three pairs of PNGs).")
+    
+    print("✅ Scenarios generated, charts saved to charts/, and data written to Google Sheets.")
 
 
 # --------------------------
 # Main CLI
 # --------------------------
+
 def main():
     ap = argparse.ArgumentParser(description="Finance-tracker CLI")
     sub = ap.add_subparsers(dest="cmd")

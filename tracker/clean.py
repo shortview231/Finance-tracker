@@ -5,7 +5,7 @@
 # - Type/category/payment canonicalization (schema-driven)
 # - Date/amount coercion
 # - Posted -> boolean (robust even if raw missing)
-# - Signed amounts (+ income, − expense)
+# - Signed amounts (+ income, - expense)
 # - Needs/Wants/Savings/Taxes bucket
 # - Validation + closest-match suggestions
 # - Final column ordering (CLEAN_HEADERS first, extras preserved)
@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 import difflib
 from datetime import datetime
-from typing import Optional, Iterable, Mapping, Dict, List, Tuple
+from typing import Optional, Iterable, Mapping, Dict, List, Tuple, Any
 
 import numpy as np
 import pandas as pd
@@ -53,6 +53,7 @@ __all__ = [
     "apply_bucket",
     "enforce_schema",
     "clean_ledger",
+    "clean_doordash_data",
 ]
 
 # -------------------------------------------------------------------
@@ -61,9 +62,9 @@ __all__ = [
 
 TEXT_DTYPES = ("object", "string")
 
-# Toggle debug prints
+# Keep debug quiet by default
 DEBUG_DATES = False
-DEBUG_UNMAPPED = True
+DEBUG_UNMAPPED = False
 
 TYPE_ALLOWED = VALUE_DOMAINS.get("type", {"income", "expense"})
 
@@ -278,7 +279,7 @@ def make_amount_signed(
     type_col: str = "type_norm",
     out_col: str = "amount_signed",
 ) -> pd.DataFrame:
-    """Apply +/− sign to amounts depending on type_norm."""
+    """Apply +/- sign to amounts depending on type_norm."""
     out = df.copy()
 
     def sign_row(row):
@@ -305,27 +306,35 @@ def fill_unknowns(df: pd.DataFrame, cols: Iterable[str] = ("category_norm", "pay
     return out
 
 def report_mapped_unmapped(df: pd.DataFrame) -> None:
-    """Print mapped pairs and unmapped raw values (to extend dictionaries)."""
+    """Print mapped pairs and truly unmapped raw values. Ignores already-canonical values."""
     if not DEBUG_UNMAPPED:
         return
 
-    def _diff(raw_col: str, norm_col: str, label: str):
+    allowed_cats = set(CATEGORY_MAP.values()) | {"misc"}
+    allowed_pm = set(PAYMENT_METHOD_MAP.values())
+
+    def _diff(raw_col: str, norm_col: str, label: str, allowed: set | None = None):
         if raw_col in df.columns and norm_col in df.columns:
             raw = df[raw_col].astype("string").str.lower().str.strip()
             norm = df[norm_col].astype("string").str.lower().str.strip()
+
             mapped = pd.DataFrame({raw_col: raw, norm_col: norm})
             mapped = mapped[(mapped[raw_col] != mapped[norm_col]) & mapped[raw_col].ne("")]
             if not mapped.empty:
                 print(f"\n[MAPPED] {label} variants (unique pairs):")
                 print(mapped.drop_duplicates().head(40).to_string(index=False))
-            same = raw[raw.eq(norm) & raw.ne("")]
+
+            if allowed is not None:
+                same = raw[(raw.eq(norm)) & raw.ne("") & (~raw.isin(allowed))]
+            else:
+                same = raw[(raw.eq(norm)) & raw.ne("")]
             if not same.empty:
                 print(f"\n[UNMAPPED] {label} values (top 20):")
                 print(same.value_counts().head(20))
 
-    _diff("category", "category_norm", "category")
-    _diff("payment_method", "payment_method_norm", "payment_method")
-    _diff("source", "source_norm", "source")
+    _diff("category", "category_norm", "category", allowed_cats)
+    _diff("payment_method", "payment_method_norm", "payment_method", allowed_pm)
+    _diff("source", "source_norm", "source", None)
 
 # -------------------------------------------------------------------
 # Validation, buckets, enforcement
@@ -409,9 +418,9 @@ def enforce_schema(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
     Enforce schema rules:
       - amount_num numeric
       - date_dt valid
-      - type_norm ∈ {'income','expense'}
-      - category_norm ∈ canonical set
-      - payment_method_norm ∈ canonical set
+      - type_norm in {'income','expense'}
+      - category_norm in canonical set
+      - payment_method_norm in canonical set
     Prints warnings + suggestions; if strict=True, raises on violations.
     """
     msgs, suggestions = _collect_violations(df)
@@ -430,6 +439,37 @@ def enforce_schema(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
 # -------------------------------------------------------------------
 # Orchestrator
 # -------------------------------------------------------------------
+def clean_doordash_data(df_doordash: pd.DataFrame, df_goals: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cleans and processes DoorDash data and calculates totals against a cap.
+    """
+    # Extract the income cap from the goals DataFrame
+    income_cap_series = df_goals[df_goals['metric'] == 'DoorDash Income Cap']['value']
+    if not income_cap_series.empty:
+        income_cap = pd.to_numeric(income_cap_series.iloc[0], errors='coerce')
+    else:
+        income_cap = 0  # Default cap if not found
+
+    # Ensure columns are in the correct format for calculations
+    df_doordash['Date'] = pd.to_datetime(df_doordash.get('Date'), errors='coerce')
+    df_doordash['Amount'] = pd.to_numeric(df_doordash.get('Amount'), errors='coerce')
+
+    # Calculate daily totals, running balance, and progress to cap
+    if 'Date' in df_doordash.columns and 'Amount' in df_doordash.columns:
+        df_doordash['daily_total'] = df_doordash.groupby('Date')['Amount'].transform('sum')
+        df_doordash['running_balance'] = df_doordash['Amount'].cumsum()
+        df_doordash['progress_to_cap'] = income_cap - df_doordash['running_balance']
+
+    # Add a 'category' column for dashboard filtering
+    df_doordash['category'] = 'doordash'
+
+    # Rename columns to match the main ledger schema
+    df_doordash = df_doordash.rename(columns={
+        'Date': 'date',
+        'Amount': 'amount'
+    })
+
+    return df_doordash
 
 def clean_ledger(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
     """Run full cleaning pipeline, return ready-to-analyze frame."""
@@ -457,6 +497,11 @@ def clean_ledger(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
     if "payment_method" in df5.columns:
         df5 = normalize_simple(df5, "payment_method", PAYMENT_METHOD_MAP, "payment_method_norm")
     df5 = fill_unknowns(df5)
+
+    # 5b) force type_norm for inherently income categories
+    if "category_norm" in df5.columns:
+        income_cats = {"doordash", "disability"}
+        df5.loc[df5["category_norm"].isin(income_cats), "type_norm"] = "income"
 
     # 6) signed amounts
     df6 = make_amount_signed(df5, amount_col="amount_num", type_col="type_norm", out_col="amount_signed")

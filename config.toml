@@ -5,4 +5,6 @@ timezone       = "America/Chicago"
 
 [ranges]
 ledger = "ledger!A:Z"
-recurr = "expenses!A:Z"
+expenses = "expenses!A:Z"
+doordash = "doordash!A:Z"
+goals = "goals!A:Z"

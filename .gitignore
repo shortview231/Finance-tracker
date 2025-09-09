@@ -24,5 +24,8 @@ Thumbs.db
 # Google OAuth tokens
 token*.json
 
-Cloud Key/
+#Cloud Key 
+cloud_key/
+cloud-key/
+charts/*.csv
 

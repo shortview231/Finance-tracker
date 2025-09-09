@@ -2,9 +2,16 @@
 spreadsheet_id = "1oNplzKXEC68PclcCW_sIGflgqZ63eV5DrzRBkMMDug4"
 calendar_id    = "primary"
 timezone       = "America/Chicago"
+token_path     = "cloud_key/finance-tracker-470201-816dececafb2.json"
 
 [ranges]
-ledger = "ledger!A:Z"
-expenses = "expenses!A:Z"
-doordash = "doordash!A:Z"
-goals = "goals!A:Z"
+ledger   = "Ledger!A:Z"
+expenses = "Expenses!A:Z"
+doordash = "DoorDash!A:Z"
+goals    = "Goals!A:Z"
+
+[bigquery]
+project_id       = "finance-tracker-470201"
+dataset          = "finance_data"
+table            = "cleaned_transactions"
+credentials_json = "cloud_key/finance-tracker-470201-816dececafb2.json"

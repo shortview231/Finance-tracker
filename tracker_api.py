@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 
 from tracker.clean import clean_ledger, validate_ledger, clean_doordash_data
 from tracker.io import read_sheets_to_dfs, write_df_to_sheet
+from tracker.bq import upload_to_bigquery
+
 
 # Optional extras from tracker.charts; safe if not present
 try:
@@ -345,7 +347,6 @@ def _generate_demo_data(start_date: str, income_level: str) -> Dict[str, pd.Data
         "Goals": goals_data,
     }
 
-
 # --------------------------
 # CLEAN command
 # --------------------------
@@ -359,18 +360,62 @@ def cmd_clean(
     """
     Run the full cleaning pipeline and preview results.
     Use --save to persist to CSV or to a Google Sheet tab.
+    Auto-fallback: if the 'Ledger' tab is empty/missing, use a demo ledger tab.
     """
+    # 1) Try the real tabs first
     dfs = read_sheets_to_dfs(tab_names=["Ledger", "Expenses", "DoorDash", "Goals"])
+
+    ledger_df = dfs.get("Ledger", pd.DataFrame())
+    if ledger_df is None or ledger_df.empty:
+        print("ℹ️ 'Ledger' tab appears empty or missing — searching demo tabs…")
+
+        # Try demo tabs in a sensible order
+        demo_tabs = ["Demo_Ledger_medium", "Demo_Ledger_high", "Demo_Ledger_low"]
+        demo_dfs = read_sheets_to_dfs(tab_names=demo_tabs)
+
+        chosen_demo = None
+        for tab in demo_tabs:
+            df_demo = demo_dfs.get(tab, pd.DataFrame())
+            if df_demo is not None and not df_demo.empty:
+                chosen_demo = tab
+                ledger_df = df_demo.copy()
+                break
+
+        if chosen_demo:
+            print(f"✅ Using demo ledger: {chosen_demo}")
+            dfs["Ledger"] = ledger_df
+        else:
+            print("⚠️ No demo tabs found with data. Aborting clean.")
+            return
+
+    # 2) Merge all frames (Ledger + DoorDash aggregation + etc.)
     merged_df = _merge_dfs(dfs)
+
+    # 3) Clean
     dfc = clean_ledger(merged_df)
 
-    # validation echo (on cleaned frame for a quick sanity view)
+    # 3b) BigQuery-safe column names (fixes invalid names like 'progress_to_$2400_cap')
+    try:
+        from tracker.clean import sanitize_column_names_for_bq
+        dfc = sanitize_column_names_for_bq(dfc)
+    except Exception as e:
+        print(f"ℹ️ Skipping column-name sanitization (not critical): {e}")
+
+    # 4) Upload cleaned data to BigQuery
+    try:
+        from tracker.bq import upload_to_bigquery
+        print("⏫ Uploading DataFrame to BigQuery …")
+        upload_to_bigquery(dfc)
+    except Exception as e:
+        print(f"⚠️ BigQuery upload failed: {e}")
+
+    # 5) Validation echo (on cleaned frame for a quick sanity view)
     try:
         validate_ledger(dfc)
     except Exception as e:
         print(f"⚠️ Validation check raised: {e}")
 
-    # PREVIEW BLOCKS
+    # 6) PREVIEW BLOCKS
     print("\n=== HEAD (first 8 rows) ===")
     print(dfc.head(8))
 
@@ -400,7 +445,7 @@ def cmd_clean(
                 print("\n=== Bad Dates (failed parse) ===")
                 print(bad_dates[["date"]].head(20))
 
-    # Posted (supports either/both columns)
+    # Posted (supports either or both columns)
     posted_cols = [c for c in ["posted", "posted_bool"] if c in dfc.columns]
     if posted_cols:
         print("\n=== Posted Preview ===")
@@ -412,7 +457,7 @@ def cmd_clean(
         print("\n=== Category Preview ===")
         print(dfc[cat_cols].head(10))
 
-    # Persist if asked
+    # 7) Persist if asked
     if save:
         if save_to_csv:
             _save_clean_preview_csv(dfc, Path(csv_path))
@@ -426,7 +471,6 @@ def cmd_clean(
                 print(f"✅ Wrote cleaned preview to Sheet tab: {sheet_tab}")
             except ImportError:
                 print("⚠️ write_df_to_sheet not found in tracker.io — CSV fallback recommended.")
-
 
 # --------------------------
 # CHARTS helpers

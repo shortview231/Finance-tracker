@@ -94,15 +94,71 @@ def _canon_map_from_aliases(mapping: Mapping[str, str]) -> Dict[str, str]:
 # -------------------------------------------------------------------
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize header names to snake_case (trim, lowercase, replace spaces with _)."""
+    """
+    Standardize header names to snake_case (trim, lowercase, spaces -> _),
+    then coalesce any duplicate column names that result from normalization.
+    The first occurrence wins, later duplicates fill gaps (NaN/blank) in the first.
+    """
     out = df.copy()
-    out.columns = (
+    norm_cols = (
         pd.Index(out.columns)
         .str.strip()
         .str.lower()
         .str.replace(r"\s+", "_", regex=True)
     )
+    out.columns = norm_cols
+
+    # If no duplicates after normalization, we are done
+    counts = out.columns.value_counts()
+    dup_names = [c for c, n in counts.items() if n > 1]
+    if not dup_names:
+        return out
+
+    def _is_blank_like(series: pd.Series) -> pd.Series:
+        """Blank for strings is empty or whitespace; for others only NaN."""
+        if pd.api.types.is_string_dtype(series) or series.dtype.name in ("object", "string"):
+            s = series.astype("string")
+            return s.isna() | s.str.strip().eq("")
+        return series.isna()
+
+    # Build a new set of columns, preserving first-seen order
+    new_cols: dict[str, pd.Series] = {}
+    seen: set[str] = set()
+
+    for idx, col_name in enumerate(out.columns):
+        if col_name in seen:
+            # already handled via coalescing
+            continue
+
+        # collect all positions for this normalized name
+        positions = [j for j, c in enumerate(out.columns) if c == col_name]
+        base = out.iloc[:, positions[0]].copy()
+
+        # coalesce later duplicates into base
+        for j in positions[1:]:
+            cand = out.iloc[:, j]
+            need = _is_blank_like(base)
+            # if both string-like, also treat cand blanks as not useful
+            if pd.api.types.is_string_dtype(cand) or cand.dtype.name in ("object", "string"):
+                cand_use = cand.where(~_is_blank_like(cand), pd.NA)
+            else:
+                cand_use = cand
+            base = base.where(~need, cand_use)
+
+        new_cols[col_name] = base
+        seen.add(col_name)
+
+    # Recreate DataFrame with coalesced, de-duplicated columns in first-seen order
+    ordered_names = []
+    seen = set()
+    for c in out.columns:
+        if c not in seen:
+            ordered_names.append(c)
+            seen.add(c)
+
+    out = pd.DataFrame({c: new_cols[c] for c in ordered_names})
     return out
+
 
 def apply_header_aliases(df: pd.DataFrame) -> pd.DataFrame:
     """Apply HEADER_ALIASES after snake_casing so raw sheet headers map to our canonical raw names."""
@@ -110,6 +166,7 @@ def apply_header_aliases(df: pd.DataFrame) -> pd.DataFrame:
     alias_norm = _canon_map_from_aliases(HEADER_ALIASES)
     out = out.rename(columns=alias_norm)
     return out
+
 
 def ensure_required_optional(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure required columns exist; create missing optional columns with defaults."""
@@ -119,35 +176,67 @@ def ensure_required_optional(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = RAW_OPTIONAL_DEFAULTS.get(col, "")
     return out
 
+
 def lowercase_strings(df: pd.DataFrame, make_norm_cols: bool = False) -> pd.DataFrame:
-    """Normalize text columns: lowercase, strip, collapse spaces, fix common typos from SPELLING_FIXES.
-    If make_norm_cols=True, also create *_norm for ALL text columns (safe defaults)."""
+    """
+    Normalize text columns: lowercase, strip, collapse spaces, fix common typos from SPELLING_FIXES.
+    If make_norm_cols=True, also create *_norm for ALL text columns (safe defaults).
+    Robust even if a column is non-string or if prior steps created odd dtypes.
+    """
     out = df.copy()
 
     def norm_series(s: pd.Series) -> pd.Series:
         return (
-            s.astype("string")
-            .str.lower()
-            .str.strip()
-            .str.replace(r"\s+", " ", regex=True)
-            .replace(SPELLING_FIXES)
+            s.astype("string", copy=False)
+             .str.lower()
+             .str.strip()
+             .str.replace(r"\s+", " ", regex=True)
+             .replace(SPELLING_FIXES)
         )
 
+    # targeted normals for common semantic columns
     for col in ("source", "category", "description", "payment_method", "name"):
         if col in out.columns:
-            norm_col = f"{col}_norm"
-            out[norm_col] = norm_series(out[col])
+            out[f"{col}_norm"] = norm_series(out[col])
 
     if make_norm_cols:
-        for c in out.columns:
-            if out[c].dtype.name in TEXT_DTYPES and not c.endswith("_norm"):
+        for c in list(out.columns):
+            # guard: if duplicate-name shenanigans ever returned a DataFrame, take first col
+            col_obj = out[c]
+            if isinstance(col_obj, pd.DataFrame):
+                col_obj = col_obj.iloc[:, 0]
+
+            dtype_name = getattr(col_obj.dtype, "name", "")
+            if dtype_name in TEXT_DTYPES and not c.endswith("_norm"):
                 norm_c = f"{c}_norm"
                 if norm_c not in out.columns:
                     out[norm_c] = (
-                        out[c].astype("string").str.lower().str.strip()
-                        .str.replace(r"\s+", " ", regex=True)
+                        col_obj.astype("string", copy=False)
+                               .str.lower()
+                               .str.strip()
+                               .str.replace(r"\s+", " ", regex=True)
                     )
     return out
+
+def sanitize_column_names_for_bq(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make column names BigQuery-safe:
+    - keep only letters, numbers, underscores
+    - collapse runs of invalid chars to a single underscore
+    - strip leading/trailing underscores
+    - ensure not empty
+    """
+    out = df.copy()
+    new_cols = (
+        pd.Index(out.columns)
+        .str.replace(r"[^A-Za-z0-9_]", "_", regex=True)
+        .str.replace(r"_+", "_", regex=True)
+        .str.strip("_")
+        .where(lambda s: s.ne(""), other="col")  # guard against empty
+    )
+    out.columns = new_cols
+    return out
+
 
 def normalize_type(df: pd.DataFrame, col: str = "type", out_col: Optional[str] = None) -> pd.DataFrame:
     """Normalize type column to 'income' or 'expense' in a new column (default: type_norm)."""
@@ -491,12 +580,20 @@ def clean_ledger(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
     if "posted" in df5.columns:
         df5 = coerce_bool(df5, col="posted", out_col="posted_bool")
 
-    # 5) category & payment canonicalization (overwrite *_norm with canonical values)
+    # 5) category and payment canonicalization
     if "category" in df5.columns:
         df5 = normalize_simple(df5, "category", CATEGORY_MAP, "category_norm")
     if "payment_method" in df5.columns:
         df5 = normalize_simple(df5, "payment_method", PAYMENT_METHOD_MAP, "payment_method_norm")
     df5 = fill_unknowns(df5)
+
+    # 5a) ensure name fields are not blank or NaN
+    if "name" in df5.columns:
+        df5["name"] = df5["name"].astype("string").fillna("N/A")
+        df5.loc[df5["name"].str.strip().eq(""), "name"] = "N/A"
+    if "name_norm" in df5.columns:
+        df5["name_norm"] = df5["name_norm"].astype("string").fillna("N/A")
+        df5.loc[df5["name_norm"].str.strip().eq(""), "name_norm"] = "N/A"
 
     # 5b) force type_norm for inherently income categories
     if "category_norm" in df5.columns:
@@ -506,20 +603,20 @@ def clean_ledger(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
     # 6) signed amounts
     df6 = make_amount_signed(df5, amount_col="amount_num", type_col="type_norm", out_col="amount_signed")
 
-    # 7) Needs/Wants/Savings/Taxes bucket
+    # 7) bucket
     df7 = apply_bucket(df6)
 
-    # 8) finalize 'posted' column (prefer posted_bool if created). If missing entirely, assume True.
+    # 8) finalize posted column
     if "posted_bool" in df7.columns:
         df7["posted"] = df7["posted_bool"].fillna(True)
     elif "posted" not in df7.columns:
         df7["posted"] = True
 
-    # 9) mapped/unmapped reports and schema enforcement
+    # 9) reports and schema enforcement
     report_mapped_unmapped(df7)
     df7 = enforce_schema(df7, strict=strict)
 
-    # 10) final ordering (keep extras at end)
+    # 10) final ordering
     ordered = [c for c in CLEAN_HEADERS if c in df7.columns]
     rest = [c for c in df7.columns if c not in ordered]
     return df7[ordered + rest]

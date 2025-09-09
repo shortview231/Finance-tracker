@@ -2,19 +2,17 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 import pandas as pd
 
-# Google API imports (module-level so types are available everywhere)
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+# Google API imports
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.oauth2 import service_account
 
 # --- config loader: tomllib on 3.11+, tomli fallback on 3.10 ---
 try:
-    import tomllib  # Python 3.11+  # type: ignore[import]
+    import tomllib  # Python 3.11+
 except ModuleNotFoundError:
     import tomli as tomllib  # Python 3.10 fallback
 
@@ -24,7 +22,7 @@ except ModuleNotFoundError:
 # =========================
 def _load_config() -> Dict[str, Any]:
     """
-    Load config.toml.
+    Load config.toml from project root.
     """
     cfg_path = Path("config.toml")
     if not cfg_path.exists():
@@ -48,16 +46,19 @@ def _get_google_sheet_id(cfg: Dict[str, Any]) -> str:
     return ssid
 
 
-def _get_token_path(cfg: Dict[str, Any]) -> Path:
-    return Path(cfg.get("google", {}).get("token_path", "token.json"))
-
-
 def _get_tab_range(cfg: Dict[str, Any], tab_name: str) -> str:
     """
-    If [ranges].tab_name is present, use it; else compose from tab_name + default range.
+    Resolve a tab range.
+    Checks [ranges] case-insensitively, else defaults to "{Tab}!A:Z".
     """
-    if cfg.get("ranges", {}).get(tab_name):
-        return cfg["ranges"][tab_name]
+    ranges = cfg.get("ranges", {}) or {}
+    # exact
+    if tab_name in ranges:
+        return ranges[tab_name]
+    # case-insensitive fallback
+    lower_map = {k.lower(): v for k, v in ranges.items()}
+    if tab_name.lower() in lower_map:
+        return lower_map[tab_name.lower()]
     return f"{tab_name}!A:Z"
 
 
@@ -68,29 +69,23 @@ READONLY_SCOPE = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 WRITE_SCOPE    = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
-def _get_credentials(scopes: List[str]) -> Credentials:
+def _get_credentials(scopes: List[str]) -> service_account.Credentials:
     """
-    Retrieve credentials for the given scopes.
+    Build service account credentials for the given scopes.
+    Expects config.toml -> [google].token_path to point at a SERVICE ACCOUNT JSON key.
     """
     cfg = _load_config()
-    token_path = _get_token_path(cfg)
+    token_path = Path(cfg.get("google", {}).get("token_path", ""))
 
-    creds: Optional[Credentials] = None
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), scopes)
+    if not token_path:
+        raise ValueError("Missing [google].token_path in config.toml (service account key path).")
+    if not token_path.exists():
+        raise FileNotFoundError(f"Google credentials JSON not found: {token_path}")
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not Path("credentials.json").exists():
-                raise FileNotFoundError(
-                    "credentials.json not found. Download OAuth client credentials from Google Cloud Console."
-                )
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", scopes)
-            creds = flow.run_local_server(port=0)
-        token_path.write_text(creds.to_json())
-
+    creds = service_account.Credentials.from_service_account_file(
+        str(token_path),
+        scopes=scopes,
+    )
     return creds
 
 
@@ -100,7 +95,8 @@ def _get_sheets_service(scopes: Optional[List[str]] = None):
     """
     SCOPES = scopes or READONLY_SCOPE
     creds = _get_credentials(SCOPES)
-    return build("sheets", "v4", credentials=creds)
+    service = build("sheets", "v4", credentials=creds)
+    return service
 
 
 def _ensure_sheet_tab(service, spreadsheet_id: str, tab_name: str) -> None:
@@ -125,24 +121,31 @@ def read_sheet_to_df(
 ) -> pd.DataFrame:
     """
     Reads a single Sheet tab into a DataFrame.
+    Uses [ranges] overrides if present in config.
     """
     cfg = _load_config()
     ssid = spreadsheet_id or _get_google_sheet_id(cfg)
     range_str = _get_tab_range(cfg, sheet_name)
 
     service = _get_sheets_service(scopes=READONLY_SCOPE)
-    result = (
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=ssid, range=range_str)
-        .execute()
-    )
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=ssid, range=range_str)
+            .execute()
+        )
+    except HttpError as e:
+        print(f"⚠️ Could not read sheet '{sheet_name}': {e}")
+        return pd.DataFrame()
+
     values: List[List[str]] = result.get("values", [])
     if not values:
         return pd.DataFrame()
 
     header = values[0]
     rows = values[1:]
+    # pad rows to header length
     fixed_rows: List[List[str]] = [r + [""] * (len(header) - len(r)) for r in rows]
     return pd.DataFrame(fixed_rows, columns=header)
 
@@ -156,11 +159,7 @@ def read_sheets_to_dfs(
     """
     dfs: Dict[str, pd.DataFrame] = {}
     for name in tab_names:
-        try:
-            dfs[name] = read_sheet_to_df(name, spreadsheet_id)
-        except HttpError as e:
-            print(f"⚠️ Could not read sheet '{name}': {e.error_details}")
-            dfs[name] = pd.DataFrame()
+        dfs[name] = read_sheet_to_df(name, spreadsheet_id)
     return dfs
 
 
@@ -172,7 +171,9 @@ def write_df_to_sheet(
     value_input_option: str = "USER_ENTERED",
 ) -> None:
     """
-    Write a DataFrame to a Sheet tab (overwrites by default).
+    Write a DataFrame to a Sheet tab. Overwrites by default.
+    - Dates are formatted as YYYY-MM-DD
+    - NaNs become empty strings
     """
     cfg = _load_config()
     ssid = spreadsheet_id or _get_google_sheet_id(cfg)
@@ -181,29 +182,36 @@ def write_df_to_sheet(
     _ensure_sheet_tab(service, ssid, tab_name)
 
     df_out = df.copy()
+
+    # Format dates and stringify others
     for c in df_out.columns:
         if pd.api.types.is_datetime64_any_dtype(df_out[c]):
             df_out[c] = pd.to_datetime(df_out[c], errors="coerce").dt.strftime("%Y-%m-%d")
         else:
-            df_out[c] = df_out[c].astype(str).replace('nan', '')
+            # Ensure clean strings for Sheets; drop "nan"
+            ser = df_out[c]
+            # If it's numeric, leave it as-is to preserve numbers in Sheets
+            if pd.api.types.is_numeric_dtype(ser):
+                continue
+            df_out[c] = ser.astype(str).replace("nan", "")
 
-    values: List[List[Any]] = [df_out.columns.tolist()] + df_out.values.tolist()
+    values: List[List[Union[str, float, int]]] = [df_out.columns.tolist()] + df_out.values.tolist()
     start_range = f"{tab_name}!A1"
 
     try:
         if clear_before_write:
             service.spreadsheets().values().clear(
                 spreadsheetId=ssid,
-                range=f"{tab_name}!A:ZZ",  # <-- FIX 1
+                range=f"{tab_name}!A:ZZ",
                 body={}
             ).execute()
 
         service.spreadsheets().values().update(
             spreadsheetId=ssid,
-            range=start_range,            # <-- FIX 2
+            range=start_range,
             valueInputOption=value_input_option,
             body={"values": values},
         ).execute()
         print(f"✅ Successfully wrote DataFrame to sheet: {tab_name}")
     except HttpError as e:
-        print(f"An error occurred: {e}")
+        print(f"❌ Sheets write failed for '{tab_name}': {e}")

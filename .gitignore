@@ -23,3 +23,8 @@ Thumbs.db
 
 # Google OAuth tokens
 token*.json
+
+#Cloud Key 
+echo "cloud_key/" >> .gitignore
+echo "cloud-key/" >> .gitignore
+echo "charts/*.csv" >> .gitignore

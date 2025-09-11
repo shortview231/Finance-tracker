@@ -31,3 +31,5 @@ charts/*.csv
 
 # Local config
 config.toml
+cloud_key/
+cloud-key/

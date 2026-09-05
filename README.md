@@ -1,121 +1,92 @@
-# Finance Tracker — Automated Data Pipeline
+# Finance Tracker Data Pipeline
 
-## At a Glance
-- **Goal:** Transform messy personal finance data into a professional analytics system.  
-- **Stack:** Google Sheets → Python (Pandas, API) → BigQuery (Cloud Warehouse) → Looker Studio (Dashboards).  
-- **Features:** End-to-end ETL pipeline, automated data cleaning, cloud-based storage, real-time BI dashboards.  
-- **Outputs:** Interactive Looker dashboards with KPIs, category analysis, and financial trends.  
-- **Demo:** [Live Dashboard](https://lookerstudio.google.com/reporting/46d94a06-c659-4b94-893c-0161a8a5b752)  
-- **Proof:** [Finance Tracker Proof Pack (PDF)](assets/finance_tracker_proof_pack.pdf)  
+A portfolio project demonstrating how structured transaction data can be cleaned, validated, modeled, stored, and presented through an analytics workflow.
 
----
+## At a glance
 
-## Tech Stack
-- **Python Libraries:** Pandas, NumPy, Google API Client, BigQuery Python SDK  
-- **Data Storage:** Google Sheets, Google BigQuery  
-- **Visualization:** Looker Studio  
-- **Development Tools:** Git/GitHub, VS Code  
+- **Stack:** Google Sheets, Python, Pandas, BigQuery, Looker Studio
+- **Focus:** data cleaning, ETL, schema validation, warehouse loading, KPI reporting
+- **Output:** analysis-ready transaction data and interactive business-intelligence views
 
----
+This repository is intended as technical portfolio evidence. Any example or demonstration data should remain synthetic or appropriately sanitized.
 
-## 1. Input — Google Sheets Ledger
-The system starts with a structured Google Sheet used as the raw ledger. Required columns:
+## Pipeline
 
-- `date` — when the transaction occurred  
-- `vendor` — payee or source  
-- `amount` — positive = income, negative = expense  
-- `category` — groceries, bills, fuel, etc.  
-- `payment_method` — card, bank, cash, etc.  
+```text
+structured ledger
+  -> Python ingestion
+  -> cleaning and normalization
+  -> schema validation
+  -> BigQuery storage
+  -> Looker Studio reporting
+```
 
-**Rationale:** A clear input schema ensures automation works without manual cleanup.
+## 1. Input layer
 
----
+The pipeline starts from a structured ledger with fields such as:
 
-## 2. Processing — Python ETL
-Python scripts transform the raw sheet into structured, validated data.  
+- `date`
+- `vendor`
+- `amount`
+- `category`
+- `payment_method`
 
-**Repo structure:**
+A defined input schema reduces downstream cleanup and makes validation rules explicit.
 
-finance-tracker/
-│── tracker_api.py # Orchestration, API calls
-│── clean.py # Normalization and parsing
-│── schema.py # BigQuery table schema
-│── utils/ # Helpers for validation, dates, logging
+## 2. Python transformation layer
 
+Python and Pandas handle the main transformation work:
 
-**Pipeline steps:**
-1. **Ingest** transactions via the Google Sheets API.  
-2. **Clean**: normalize dates, parse amounts, standardize categories.  
-3. **Validate**: check required fields, flag errors, enforce schema.  
-4. **Prepare**: output structured rows for loading into BigQuery.  
+1. ingest structured transaction rows
+2. normalize dates and numeric values
+3. standardize categories and text fields
+4. validate required fields
+5. flag malformed records
+6. prepare clean rows for warehouse loading
 
-**Why this matters:** the ETL layer ensures every record is accurate, consistent, and analysis-ready.
+Representative modules separate orchestration, cleaning, schema definition, and helper logic so the pipeline is easier to test and maintain.
 
----
+## 3. BigQuery storage
 
-## 3. Storage — Google BigQuery
-Cleaned data is loaded into BigQuery, creating a scalable cloud warehouse.  
+Validated rows are loaded into BigQuery using an explicit table schema. This provides a central analytical layer that can support historical queries, aggregation, and dashboard reporting.
 
-- **Centralized:** all financial history in one location.  
-- **Structured:** explicit schema for transactions.  
-- **Scalable:** supports years of financial records with query-level analytics.  
+## 4. Reporting
 
-Data is appended automatically using the BigQuery Python client.
+Looker Studio connects to the analytical tables for views such as:
 
----
+- income and expense KPIs
+- category breakdowns
+- monthly trends
+- transaction-level tables
+- savings and cash-flow summaries where supported by the data
 
-## 4. Visualization — Looker Studio Dashboards
-Looker Studio connects directly to BigQuery for live analytics.  
+## Engineering practices demonstrated
 
-Delivered dashboards include:  
-- **KPI Gauges:** monthly income vs. expenses.  
-- **Trends:** line charts showing income, expenses, and savings rate over time.  
-- **Breakdowns:** category pie charts and tables for granular insight.  
+- explicit input schemas
+- repeatable data cleaning
+- separation of transformation logic from presentation
+- validation before warehouse loading
+- documented analytical assumptions
+- cloud data-warehouse usage
+- business-intelligence reporting
+- maintainable project structure
 
-![Dashboard Screenshot](assets/dashboard_screenshot.png)  
+## Skills demonstrated
 
-- [View Live Dashboard](https://lookerstudio.google.com/reporting/46d94a06-c659-4b94-893c-0161a8a5b752)  
-- [Download Proof Pack (PDF)](assets/finance_tracker_proof_pack.pdf)  
+- Python
+- Pandas
+- Google Sheets API workflows
+- BigQuery
+- SQL-oriented data modeling
+- ETL and data cleaning
+- Looker Studio
+- KPI design
+- technical documentation
 
----
+## Data-safety boundary
 
-## 5. Lessons Learned
-- Start simple with clean headers; complexity comes later.  
-- Always separate logic into files/modules to scale and maintain easily.  
-- Cloud-first mindset: even personal projects benefit from warehouse + BI design.  
-- Documentation matters: a project is only complete when its story is clear.  
+This public repository should contain only sanitized or synthetic examples. Credentials, account identifiers, private financial records, personal transaction history, and production configuration do not belong in the public repository.
 
----
+## Portfolio positioning
 
-## 6. Setup (Optional for Users)
-1. Clone the repo.  
-2. Create a Google Sheet with the headers listed above.  
-3. Configure a BigQuery dataset and table (see `schema.py`).  
-4. Add Google API credentials to your environment.  
-5. Run the pipeline:  
-   ```bash
-   python tracker_api.py
-Connect Looker Studio to BigQuery.
-
-View dashboards.
-
-7. Future Roadmap
-
-This project is already fully functional, but I have plans to expand it further:
-
-Backfill historical data: integrating past years of bank transactions for long-term analysis.
-
-Automated ingestion: parsing emails and bank exports to remove all manual entry.
-
-Forecasting models: projecting income, expenses, and savings to improve financial planning.
-
-Tax preparation insights: generating categorized, year-end reports to simplify filing season.
-
-Personal finance app vision: evolving into a fully automated, always-on personal banking assistant.
-
-Conclusion
-
-This project demonstrates how everyday financial tracking can be elevated into a full analytics pipeline. What begins as a simple Google Sheet evolves into a production-style ETL system with automated cleaning, cloud storage, and interactive BI dashboards.
-
-Key takeaway: data engineering is about turning raw, chaotic inputs into clear, actionable insights — whether for a Fortune 500 company or personal finance.
-   
+The project demonstrates a practical data-engineering pattern: take messy operational records, apply repeatable validation and transformation rules, store the result in an analytical system, and surface decision-ready reporting.
